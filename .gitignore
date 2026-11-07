@@ -1,0 +1,32 @@
+# ===== Rahasia dan konfigurasi lokal =====
+.env
+.env.*
+!.env.example
+
+# ===== Lingkungan Python =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ===== Data berat: jangan masuk repo =====
+storage/*
+!storage/.gitkeep
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.wav
+*.mp3
+
+# ===== Frontend (nanti) =====
+node_modules/
+dist/
+
+# ===== Editor dan sistem =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
