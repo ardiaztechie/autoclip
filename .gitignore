@@ -13,6 +13,7 @@ __pycache__/
 # ===== Data berat: jangan masuk repo =====
 storage/*
 !storage/.gitkeep
+models/
 *.mp4
 *.mov
 *.mkv
