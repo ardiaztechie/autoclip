@@ -1,7 +1,7 @@
 """scoring.py: memberi nilai pada calon clip.
 
 Bagian 1 (file ini): skor Hook dan Flow, validasi data, dan rincian per indikator.
-Bagian 2 (menyusul) : skor Value dan Trend.
+Bagian 2 (file ini): skor Value dan Trend.
 Bagian 3 (menyusul) : penggabungan menjadi skor akhir 0-100.
 
 PRINSIP
@@ -21,9 +21,10 @@ Cara mencoba tanpa video (data contoh bawaan):
 import math
 import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 
-from .models import TANDA_AKHIR, Candidate, Sentence, Word
+from .models import TANDA_AKHIR, Candidate, EnergyProfile, Sentence, Word
 
 # ===========================================================================
 # PARAMETER (nilai awal, dapat diuji)
@@ -330,6 +331,310 @@ def flow_score(calon: Candidate) -> float:
 
 
 # ===========================================================================
+# BAGIAN 2: VALUE dan TREND
+# ===========================================================================
+# --- Parameter VALUE ---------------------------------------------------------
+PANJANG_MIN_ISTILAH = 3        # token lebih pendek dari ini tidak dihitung sebagai istilah
+MIN_KALIMAT_IDF = 10           # korpus lebih kecil dari ini: IDF tidak andal, Value tidak dihitung
+JUMLAH_ISTILAH_TERATAS = 3     # berapa istilah penyumbang terbesar yang dilaporkan
+
+# --- Parameter TREND ---------------------------------------------------------
+BOBOT_TREND = {"energi": 0.70, "penanda": 0.30}
+FAKTOR_PENANDA = 10.0          # skor penanda 1 bila penanda mencapai 10% dari jumlah kata
+TOLERANSI_CAKUPAN_ENERGI = 1.0  # langkah. Calon boleh berakhir paling jauh sebesar ini di luar profil
+
+# Penanda emosi/penekanan. Seperti daftar lain, ini nilai awal yang dapat disetel dan
+# hanya mencocokkan kata permukaan (tidak memahami konteks atau sarkasme).
+KATA_EMOSI = frozenset({
+    "wow", "wah", "astaga", "gila", "hebat", "keren", "parah", "mengerikan", "menakjubkan",
+    "sedih", "marah", "kesal", "kecewa", "bangga", "takut", "kaget", "benci", "bahagia",
+    "amazing", "incredible", "crazy", "love", "hate", "terrible", "awesome",
+})
+FRASA_EMOSI = ("luar biasa", "ya ampun")
+
+
+def _normalisasi_minmax(nilai: list[float]) -> list[float]:
+    """Skala ulang ke 0..1 antar calon. Kosong -> []; semua sama atau hanya satu -> 0.5."""
+    if not nilai:
+        return []
+    bawah, atas = min(nilai), max(nilai)
+    if atas - bawah <= 1e-12:
+        return [0.5] * len(nilai)
+    return [(x - bawah) / (atas - bawah) for x in nilai]
+
+
+# ===========================================================================
+# VALUE: seberapa kaya istilah khas pada calon dibanding seluruh video?
+# ===========================================================================
+@dataclass(frozen=True)
+class ModelIDF:
+    """IDF per istilah, dihitung dari seluruh kalimat video (satu kalimat = satu dokumen)."""
+    idf: dict
+    jumlah_kalimat: int
+    memadai: bool
+    idf_baru: float                 # IDF untuk istilah yang tidak ada di korpus
+
+    def bobot(self, istilah: str) -> float:
+        return self.idf.get(istilah, self.idf_baru)
+
+
+@dataclass(frozen=True)
+class RincianValue:
+    skor: float                     # 0..1, sudah dinormalisasi antar calon
+    valid: bool = True
+    masalah: tuple = ()
+    nilai_mentah: float = 0.0       # sebelum normalisasi (rata-rata IDF tertimbang frekuensi)
+    jumlah_istilah: int = 0
+    istilah_teratas: tuple = ()
+
+
+def _istilah(teks: str) -> list[str]:
+    """Token yang dihitung sebagai istilah: cukup panjang dan bukan angka murni."""
+    return [t for t in _token(teks) if len(t) >= PANJANG_MIN_ISTILAH and not t.isdigit()]
+
+
+def _kalimat_teks(kalimat):
+    """Teks sebuah kalimat, atau None bila datanya tidak berbentuk kalimat berisi kata."""
+    try:
+        kata = getattr(kalimat, "words", None)
+        if not isinstance(kata, (list, tuple)):
+            return None
+        teks = [w.text for w in kata if isinstance(getattr(w, "text", None), str)]
+    except Exception:  # noqa: BLE001  objek rusak (properti melempar error) dianggap bukan kalimat
+        return None
+    return " ".join(teks) if teks else None
+
+
+def build_idf(kalimat) -> ModelIDF:
+    """Membangun model IDF dari seluruh kalimat video. Data sampah dilewati, bukan error."""
+    df: Counter = Counter()
+    n = 0
+    try:
+        daftar = list(kalimat)
+    except TypeError:
+        daftar = []
+    for k in daftar:
+        teks = _kalimat_teks(k)
+        if teks is None:
+            continue
+        n += 1
+        df.update(set(_istilah(teks)))
+    idf = {t: math.log((1 + n) / (1 + d)) + 1.0 for t, d in df.items()}
+    return ModelIDF(idf, n, n >= MIN_KALIMAT_IDF, math.log(1 + n) + 1.0)
+
+
+def _value_mentah(calon: Candidate, model: ModelIDF):
+    """Sum(tf x idf) dengan tf = porsi istilah terhadap seluruh token istilah calon.
+
+    Memakai porsi (bukan jumlah mentah) dan bukan top-N supaya panjang calon tidak
+    mengubah nilai: pola kalimat yang sama menghasilkan nilai yang sama pada 5 maupun 20 kalimat.
+    """
+    token: list[str] = []
+    for k in calon.sentences:
+        token += _istilah(_kalimat_teks(k) or "")
+    if not token:
+        return 0.0, 0, ()
+    total = len(token)
+    sumbangan = {t: (c / total) * model.bobot(t) for t, c in Counter(token).items()}
+    teratas = sorted(sumbangan.items(), key=lambda x: (-x[1], x[0]))[:JUMLAH_ISTILAH_TERATAS]
+    return sum(sumbangan.values()), total, tuple(t for t, _ in teratas)
+
+
+def value_scores(calon_list, model: ModelIDF) -> list[RincianValue]:
+    """Skor Value untuk SEKUMPULAN calon (dinormalisasi min-max antar calon yang valid).
+
+    Karena dinormalisasi antar kandidat, skor menyatakan peringkat relatif dalam satu
+    video, bukan kualitas mutlak, dan berubah bila kumpulan kandidatnya berubah.
+    Calon tidak valid, atau korpus terlalu kecil, menghasilkan skor 0.0 dan valid=False.
+
+    Keterbatasan: mengukur keragaman istilah, bukan kebenaran atau manfaat isi. Pengulangan
+    satu kata langka dapat menaikkan nilai. Tokenisasi per spasi tidak cocok untuk bahasa
+    tanpa spasi (Mandarin, Jepang, Thai).
+    """
+    daftar = list(calon_list)
+    hasil: list = [None] * len(daftar)
+    idx, mentah = [], []
+    for i, c in enumerate(daftar):
+        masalah = validasi_calon(c)
+        if masalah:
+            hasil[i] = RincianValue(0.0, False, tuple(masalah))
+        elif not model.memadai:
+            hasil[i] = RincianValue(0.0, False, (
+                f"korpus terlalu kecil untuk IDF ({model.jumlah_kalimat} kalimat, minimal {MIN_KALIMAT_IDF})",))
+        else:
+            nilai, jumlah, teratas = _value_mentah(c, model)
+            hasil[i] = RincianValue(0.0, True, (), nilai, jumlah, teratas)
+            idx.append(i)
+            mentah.append(nilai)
+    for i, skor in zip(idx, _normalisasi_minmax(mentah)):
+        hasil[i] = replace(hasil[i], skor=_batasi(skor))
+    return hasil
+
+
+# ===========================================================================
+# TREND: seberapa bertenaga suara dan seberapa banyak penanda emosi pada calon?
+# ===========================================================================
+@dataclass(frozen=True)
+class RincianTrend:
+    skor: float
+    valid: bool = True
+    masalah: tuple = ()
+    energi_tersedia: bool = False
+    rasio_energi: float = 0.0       # energi rata-rata calon / energi rata-rata seluruh video
+    skor_energi: float = 0.0        # rasio dinormalisasi min-max antar calon
+    jumlah_penanda: int = 0
+    skor_penanda: float = 0.0
+    penanda_ditemukan: tuple = ()
+
+
+def _masalah_energi(profil) -> list[str]:
+    """Memeriksa profil energi. Daftar kosong = layak dipakai."""
+    langkah = getattr(profil, "step", None)
+    nilai = getattr(profil, "values", None)
+    if not _angka_valid(langkah) or langkah <= 0:
+        return ["langkah (step) profil energi bukan angka positif yang valid"]
+    if not isinstance(nilai, (list, tuple)) or len(nilai) == 0:
+        return ["profil energi kosong"]
+    for i, x in enumerate(nilai, start=1):
+        if not _angka_valid(x) or x < 0:
+            return [f"nilai energi ke-{i} bukan angka valid atau negatif"]
+    total = sum(nilai)
+    if not math.isfinite(total):
+        return ["jumlah energi tak hingga"]
+    if total <= 0:
+        return ["energi seluruh video nol (tidak ada pembanding)"]
+    return []
+
+
+def _rata_energi(profil, mulai: float, akhir: float):
+    """Rata-rata energi tertimbang waktu pada mulai..akhir, atau None bila di luar cakupan.
+
+    Tiap nilai mewakili rentang [i*step, (i+1)*step). Lebih akurat daripada
+    EnergyProfile.mean yang membulatkan indeks.
+    """
+    langkah, nilai = profil.step, profil.values
+    if akhir > len(nilai) * langkah + langkah * TOLERANSI_CAKUPAN_ENERGI + 1e-9:
+        return None
+    awal_i = max(0, int(mulai // langkah))
+    akhir_i = min(len(nilai) - 1, int(akhir // langkah))
+    jumlah = bobot = 0.0
+    for i in range(awal_i, akhir_i + 1):
+        tumpang = min(akhir, (i + 1) * langkah) - max(mulai, i * langkah)
+        if tumpang > 0:
+            jumlah += nilai[i] * tumpang
+            bobot += tumpang
+    return jumlah / bobot if bobot > 0 else None
+
+
+def _penanda(calon: Candidate):
+    """Menghitung penanda emosi: kata mengandung '!' (sekali per kata) + kata/frasa emosi."""
+    jumlah, ditemukan = 0, []
+    for w in calon.words:
+        if "!" in w.text:
+            jumlah += 1
+            ditemukan.append("!")
+        bersih = _bersihkan_kata(w.text)
+        if bersih in KATA_EMOSI:
+            jumlah += 1
+            ditemukan.append(bersih)
+    teks_token = " " + " ".join(_token(calon.text)) + " "
+    for f in FRASA_EMOSI:
+        n = len(re.findall(rf"(?= {re.escape(f)} )", teks_token))
+        jumlah += n
+        ditemukan += [f] * n
+    return jumlah, tuple(ditemukan)
+
+
+def trend_scores(calon_list, energi=None) -> list[RincianTrend]:
+    """Skor Trend untuk SEKUMPULAN calon.
+
+    skor = 0,70 x skor_energi + 0,30 x skor_penanda
+      skor_energi  : rasio energi calon terhadap rata-rata video, min-max antar calon
+      skor_penanda : min(1, (penanda / jumlah kata) x 10)
+
+    energi=None : hanya penanda yang dipakai (energi_tersedia=False). Skornya TIDAK
+                  setara skala dengan versi lengkap, jadi jangan dicampur dalam satu peringkat.
+    Profil energi rusak, atau calon di luar cakupan profil, menghasilkan skor 0.0, valid=False.
+
+    Keterbatasan: energi RMS juga naik karena tepuk tangan atau musik, bukan hanya
+    isi yang menarik. Min-max dapat melebarkan selisih kecil menjadi 0..1 bila semua
+    calon sebenarnya mirip. Penanda hanya mencocokkan kata permukaan.
+    """
+    daftar = list(calon_list)
+    masalah_profil = _masalah_energi(energi) if energi is not None else []
+    hasil: list = [None] * len(daftar)
+    idx, rasio, tempat = [], [], {}
+    rata_video = None
+    if energi is not None and not masalah_profil:
+        rata_video = sum(energi.values) / len(energi.values)
+
+    for i, c in enumerate(daftar):
+        masalah = validasi_calon(c)
+        if masalah:
+            hasil[i] = RincianTrend(0.0, False, tuple(masalah))
+            continue
+        if masalah_profil:
+            hasil[i] = RincianTrend(0.0, False, ("profil energi bermasalah: " + masalah_profil[0],))
+            continue
+        jumlah, ditemukan = _penanda(c)
+        skor_p = _batasi((jumlah / len(c.words)) * FAKTOR_PENANDA)
+        if energi is None:
+            hasil[i] = RincianTrend(skor_p, True, (), False, 0.0, 0.0, jumlah, skor_p, ditemukan)
+            continue
+        rata = _rata_energi(energi, c.start, c.end)
+        if rata is None:
+            hasil[i] = RincianTrend(0.0, False, ("calon berada di luar cakupan profil energi",))
+            continue
+        idx.append(i)
+        rasio.append(rata / rata_video)
+        tempat[i] = (jumlah, skor_p, ditemukan)
+
+    for i, r, skor_e in zip(idx, rasio, _normalisasi_minmax(rasio)):
+        jumlah, skor_p, ditemukan = tempat[i]
+        skor = _batasi(BOBOT_TREND["energi"] * skor_e + BOBOT_TREND["penanda"] * skor_p)
+        hasil[i] = RincianTrend(skor, True, (), True, r, skor_e, jumlah, skor_p, ditemukan)
+    return hasil
+
+
+# ---------------------------------------------------------------------------
+# Data contoh untuk demo Value dan Trend
+# ---------------------------------------------------------------------------
+_KORPUS_DEMO = (
+    "Fotosintesis mengubah cahaya matahari menjadi energi kimia melalui klorofil daun.",
+    "Inflasi memengaruhi daya beli dan suku bunga pasar modal secara bertahap.",
+    "Nutrisi atlet muda menentukan stamina, pemulihan otot, dan prestasi pertandingan.",
+    "Irama gamelan menuntun harmoni lagu daerah pada upacara adat.",
+    "Pajak usaha kecil diatur regulasi khusus dengan tarif final tertentu.",
+    "Candi peninggalan kerajaan kuno menyimpan prasasti sejarah yang berharga.",
+    "Sensor presisi pada mesin pintar mendeteksi getaran sebelum komponen rusak.",
+    "Rempah nusantara membentuk cita rasa kuliner dan perdagangan maritim dunia.",
+    "Arsitektur rumah tropis memakai ventilasi silang untuk menurunkan suhu ruangan.",
+    "Astronomi mempelajari galaksi, bintang, dan nebula di langit malam.",
+    "Kita dan yang itu kita dan yang itu.",
+    "Kita dan yang itu kita dan yang itu lagi.",
+)
+
+
+def _kalimat_waktu(teks: str, mulai: float, kecepatan: float = 2.5) -> Sentence:
+    langkah = 1.0 / kecepatan
+    return Sentence([Word(t, round(mulai + i * langkah, 3), round(mulai + i * langkah + langkah * 0.9, 3))
+                     for i, t in enumerate(teks.split())])
+
+
+def _calon_waktu(teks: str, mulai: float, kecepatan: float = 2.5) -> Candidate:
+    return Candidate([_kalimat_waktu(teks, mulai, kecepatan)])
+
+
+def _rangkai_kalimat(daftar_teks, mulai: float = 0.0, jeda: float = 0.3) -> list:
+    hasil, t = [], mulai
+    for teks in daftar_teks:
+        k = _kalimat_waktu(teks, t)
+        hasil.append(k)
+        t = k.end + jeda
+    return hasil
+
+
+# ===========================================================================
 # DEMO: python -m core.scoring
 # ===========================================================================
 def _calon_dari_kata(kata: list) -> Candidate:
@@ -429,6 +734,48 @@ def _demo() -> int:
         pertama = rh.masalah[0] if rh.masalah else "-"
         print(f"  {nama:<40}{('ya' if rh.valid else 'TIDAK'):>6}{rh.skor:>7.2f}{rf.skor:>7.2f}   {pertama}")
 
+    # ---------------- VALUE ----------------
+    print("\nVALUE: kekayaan istilah (TF-IDF per kalimat), dinormalisasi antar calon")
+    korpus = _rangkai_kalimat(_KORPUS_DEMO)
+    model = build_idf(korpus)
+    print(f"  korpus demo: {model.jumlah_kalimat} kalimat, IDF memadai: {'ya' if model.memadai else 'TIDAK'}")
+    kasus_value = [
+        ("Istilah beragam dan khas", Candidate([korpus[0], korpus[9]])),
+        ("Kata umum berulang", Candidate([korpus[10], korpus[11]])),
+        ("5 kalimat (pola A)", Candidate(_rangkai_kalimat(_KORPUS_DEMO[:5]))),
+        ("20 kalimat (pola A diulang 4x)", Candidate(_rangkai_kalimat(_KORPUS_DEMO[:5] * 4))),
+        ("Calon tanpa kalimat", Candidate([])),
+    ]
+    rv = dict(zip([n for n, _ in kasus_value], value_scores([c for _, c in kasus_value], model)))
+    print(f"  {'kasus':<34}{'valid':>6}{'mentah':>9}{'skor':>7}   istilah teratas")
+    for nama, r in rv.items():
+        print(f"  {nama:<34}{('ya' if r.valid else 'TIDAK'):>6}{r.nilai_mentah:>9.3f}{r.skor:>7.2f}   "
+              f"{', '.join(r.istilah_teratas) if r.valid else (r.masalah[0] if r.masalah else '-')}")
+    rv_kecil = value_scores([kasus_value[0][1]], build_idf(korpus[:3]))[0]
+    print(f"  Korpus hanya 3 kalimat -> valid={rv_kecil.valid}, skor={rv_kecil.skor:.2f}: {rv_kecil.masalah[0]}")
+
+    # ---------------- TREND ----------------
+    print("\nTREND: energi suara relatif video (70%) + penanda emosi (30%)")
+    biasa50 = " ".join(["kata"] * 49 + ["kata."])
+    emosi50 = " ".join(["Wow!", "Ini", "luar", "biasa,", "gila!", "keren!"] + ["kata"] * 43 + ["kata."])
+    energi = EnergyProfile(step=1.0, values=[3.0 if 40 <= i < 60 else 1.0 for i in range(100)])
+    kasus_trend = [
+        ("Energi rendah (0-20 dtk)", _calon_waktu(biasa50, 0.0)),
+        ("Energi tinggi (40-60 dtk)", _calon_waktu(biasa50, 40.0)),
+        ("Energi rendah + penanda emosi", _calon_waktu(emosi50, 20.0)),
+        ("Di luar cakupan profil (150 dtk)", _calon_waktu(biasa50, 150.0)),
+    ]
+    rt = dict(zip([n for n, _ in kasus_trend], trend_scores([c for _, c in kasus_trend], energi)))
+    print(f"  {'kasus':<34}{'valid':>6}{'rasio':>7}{'energi':>8}{'penanda':>9}{'p.skor':>8}{'TOTAL':>7}")
+    for nama, r in rt.items():
+        print(f"  {nama:<34}{('ya' if r.valid else 'TIDAK'):>6}{r.rasio_energi:>7.2f}{r.skor_energi:>8.2f}"
+              f"{r.jumlah_penanda:>9d}{r.skor_penanda:>8.2f}{r.skor:>7.2f}")
+    tanpa_energi = trend_scores([c for _, c in kasus_trend[1:3]], None)
+    print("  Tanpa profil energi (hanya penanda): "
+          + ", ".join(f"skor {r.skor:.2f} (energi_tersedia={r.energi_tersedia})" for r in tanpa_energi))
+    rusak = trend_scores([c for _, c in kasus_trend[:2]], EnergyProfile(step=1.0, values=[1.0, float("nan")]))
+    print(f"  Profil energi rusak (NaN): valid={[r.valid for r in rusak]}, skor={[r.skor for r in rusak]}")
+
     # ---------------- RINGKASAN ----------------
     def cek(keterangan: str, kondisi: bool) -> None:
         nonlocal ok_semua
@@ -466,6 +813,25 @@ def _demo() -> int:
         and f["Akhir elipsis tunggal (…)"].skor_lengkap == SKOR_TANPA_TANDA_AKHIR)
     cek("13. Tanda tanya tetap dianggap lengkap",
         f["Akhir tanda tanya tetap lengkap"].skor_lengkap == 1.0)
+    cek("14. Value: istilah beragam dan khas > kata umum berulang",
+        rv["Istilah beragam dan khas"].skor > rv["Kata umum berulang"].skor)
+    cek("15. Value tidak bias panjang (5 vs 20 kalimat, pola sama: nilai mentah sama)",
+        abs(rv["5 kalimat (pola A)"].nilai_mentah - rv["20 kalimat (pola A diulang 4x)"].nilai_mentah) < 1e-9)
+    cek("16. Value: data tidak valid dan korpus kecil -> skor 0, valid=False",
+        (not rv["Calon tanpa kalimat"].valid) and rv["Calon tanpa kalimat"].skor == 0.0
+        and (not rv_kecil.valid) and rv_kecil.skor == 0.0)
+    cek("17. Trend: energi tinggi > energi rendah (penanda sama)",
+        rt["Energi tinggi (40-60 dtk)"].skor > rt["Energi rendah (0-20 dtk)"].skor)
+    cek("18. Trend: penanda emosi menaikkan skor (energi sama)",
+        rt["Energi rendah + penanda emosi"].skor > rt["Energi rendah (0-20 dtk)"].skor)
+    cek("19. Trend tanpa profil energi tetap jalan dan ditandai energi_tersedia=False",
+        all(r.valid and (not r.energi_tersedia) and 0.0 <= r.skor <= 1.0 for r in tanpa_energi))
+    cek("20. Trend: profil energi rusak -> semua tidak valid, skor 0, tidak crash",
+        all((not r.valid) and r.skor == 0.0 for r in rusak))
+    semua_vt = [r.skor for r in rv.values()] + [r.skor for r in rt.values()] + [r.skor for r in tanpa_energi]
+    cek("21. Di luar cakupan ditolak; bobot Trend = 1; semua skor 0..1",
+        (not rt["Di luar cakupan profil (150 dtk)"].valid) and abs(sum(BOBOT_TREND.values()) - 1.0) < 1e-9
+        and all(0.0 <= s <= 1.0 for s in semua_vt))
     return 0 if ok_semua else 1
 
 
