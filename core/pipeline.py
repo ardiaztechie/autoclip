@@ -4,11 +4,13 @@ Tidak ada rumus baru di sini. Modul ini hanya MEMANGGIL modul yang sudah ada:
 segments.split_sentences, segments.build_candidates, scoring.build_idf,
 scoring.nilai_calon, selection.pilih_klip. Nilai awal ikut modul masing-masing.
 
-Profil energi suara BELUM dihitung (itu tahap berikutnya), jadi Trend hanya dari penanda
-emosi (energi=None). Skor dari mode ini TIDAK setara dengan skor yang memakai energi.
+Tanpa --media, profil energi suara tidak dipakai: Trend hanya dari penanda emosi
+(energi=None). Dengan --media, energi RMS per detik dihitung (core.audio) dan dipakai.
+Skor kedua mode TIDAK setara, jangan dibandingkan langsung.
 
 Cara pakai (dari folder proyek, .venv aktif):
     python -m core.pipeline storage/uji/kata.json --n 3 --simpan storage/uji/klip.json
+    python -m core.pipeline storage/uji/kata.json --media storage/uji/video_uji.mp4
 """
 import argparse
 import json
@@ -16,6 +18,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .audio import hitung_energi
 from .scoring import build_idf, nilai_calon, nilai_huruf
 from .segments import build_candidates, split_sentences
 from .selection import pilih_klip
@@ -87,12 +90,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Rantai terminal: kata -> klip terpilih.")
     ap.add_argument("kata_json", help="berkas JSON hasil core.transcribe --simpan")
     ap.add_argument("--n", type=int, default=3, help="jumlah klip (bawaan 3)")
+    ap.add_argument("--media", default=None, help="video/audio asal transkrip, untuk menghitung energi suara")
     ap.add_argument("--simpan", default=None, help="simpan klip terpilih ke berkas JSON")
     arg = ap.parse_args(argv)
     try:
         kata = dari_json(Path(arg.kata_json).read_text(encoding="utf-8"))
-        hasil = jalankan_rantai(kata, arg.n)
-    except (OSError, ValueError) as e:
+        energi = hitung_energi(arg.media) if arg.media else None
+        hasil = jalankan_rantai(kata, arg.n, energi)
+    except (OSError, ValueError, RuntimeError) as e:
         print(f"[GAGAL] {e}")
         return 1
     print(_tampil(hasil))

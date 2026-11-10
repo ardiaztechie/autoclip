@@ -50,3 +50,22 @@ def test_terminal_json_rusak(tmp_path, capsys):
     f = tmp_path / "rusak.json"
     f.write_text("bukan json", encoding="utf-8")
     assert P.main([str(f)]) == 1
+
+
+def test_rantai_dengan_energi(tmp_path, capsys):
+    import math
+    import wave
+
+    import numpy as np
+    kata = kata_sintetis(600)                              # sekitar 240 dtk
+    t = np.arange(250 * 16000) / 16000
+    sinyal = (0.1 + 0.7 * (t > 120)) * np.sin(2 * math.pi * 300 * t)
+    wav = tmp_path / "a.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes((sinyal * 32767).astype("<i2").tobytes())
+    masuk = tmp_path / "kata.json"
+    masuk.write_text(ke_json(kata), encoding="utf-8")
+    assert P.main([str(masuk), "--media", str(wav)]) == 0
+    assert "dengan energi suara" in capsys.readouterr().out
+    assert P.main([str(masuk), "--media", str(tmp_path / "tidak_ada.wav")]) == 1
