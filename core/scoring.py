@@ -2,7 +2,7 @@
 
 Bagian 1 (file ini): skor Hook dan Flow, validasi data, dan rincian per indikator.
 Bagian 2 (file ini): skor Value dan Trend.
-Bagian 3 (menyusul) : penggabungan menjadi skor akhir 0-100.
+Bagian 3 (file ini): penggabungan menjadi skor akhir 0-100.
 
 PRINSIP
   - Setiap skor bernilai 0.0 sampai 1.0 (makin tinggi makin baik).
@@ -24,7 +24,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, replace
 
-from .models import TANDA_AKHIR, Candidate, EnergyProfile, Sentence, Word
+from .models import TANDA_AKHIR, Candidate, EnergyProfile, ScoredCandidate, Sentence, Word
 
 # ===========================================================================
 # PARAMETER (nilai awal, dapat diuji)
@@ -635,6 +635,84 @@ def _rangkai_kalimat(daftar_teks, mulai: float = 0.0, jeda: float = 0.3) -> list
 
 
 # ===========================================================================
+# BAGIAN 3: SKOR AKHIR 0-100
+# ===========================================================================
+# Bobot awal (dari dokumen rencana). Nilai awal yang akan disetel pada pengujian.
+BOBOT_AKHIR = {"hook": 0.30, "flow": 0.25, "value": 0.25, "trend": 0.20}
+
+# Batas huruf nilai (skor akhir 0-100). Hanya label bantu tampilan, bukan standar baku.
+BATAS_HURUF = (("A", 80.0), ("B", 65.0), ("C", 50.0))   # di bawah batas terakhir = "D"
+
+
+def nilai_huruf(skor: float) -> str:
+    """Label huruf dari skor akhir 0-100."""
+    for huruf, batas in BATAS_HURUF:
+        if skor >= batas:
+            return huruf
+    return "D"
+
+
+@dataclass(frozen=True)
+class HasilPenilaian:
+    dinilai: list                   # list[ScoredCandidate], urutan sama dengan masukan
+    ditolak: list                   # list[(nomor_masukan, alasan)], nomor mulai dari 0
+    indeks_dinilai: list            # nomor masukan tiap calon pada `dinilai`
+
+
+def nilai_calon(calon_list, model: ModelIDF, energi=None) -> HasilPenilaian:
+    """Menilai sekumpulan calon dan MEMBUANG yang tidak layak LEBIH DULU.
+
+    Urutan kerja (penting karena Value dan Trend dinormalisasi antar calon):
+      1. buang calon tidak valid (validasi_calon)
+      2. buang calon di luar cakupan profil energi, atau semua calon bila profil energi rusak
+      3. hitung ulang Value dan Trend hanya pada calon yang tersisa
+      4. skor akhir = 100 x (0,30 Hook + 0,25 Flow + 0,25 Value + 0,20 Trend)
+
+    Calon yang dibuang dicatat beserta alasannya, tidak diberi skor "tengah".
+    energi=None berarti Trend hanya dari penanda emosi (skala tidak setara; jangan dicampur
+    dengan hasil yang memakai profil energi).
+    """
+    daftar = list(calon_list)
+    ditolak: list = []
+    layak: list = []                                   # (nomor, calon)
+    for i, c in enumerate(daftar):
+        masalah = validasi_calon(c)
+        if masalah:
+            ditolak.append((i, tuple(masalah)))
+        else:
+            layak.append((i, c))
+
+    # Tahap 2: tapis dengan Trend, lalu normalisasi ulang tanpa yang dibuang
+    rt = trend_scores([c for _, c in layak], energi)
+    sisa = []
+    for (i, c), r in zip(layak, rt):
+        if r.valid:
+            sisa.append((i, c))
+        else:
+            ditolak.append((i, tuple(r.masalah)))
+    rt = trend_scores([c for _, c in sisa], energi)
+    rv = value_scores([c for _, c in sisa], model)
+
+    dinilai, indeks = [], []
+    for (i, c), v, t in zip(sisa, rv, rt):
+        if not v.valid:
+            ditolak.append((i, tuple(v.masalah)))
+            continue
+        h, f = hook_score(c), flow_score(c)
+        skor = 100.0 * (BOBOT_AKHIR["hook"] * h + BOBOT_AKHIR["flow"] * f
+                        + BOBOT_AKHIR["value"] * v.skor + BOBOT_AKHIR["trend"] * t.skor)
+        dinilai.append(ScoredCandidate(c, h, f, v.skor, t.skor, _batasi(skor, 0.0, 100.0)))
+        indeks.append(i)
+    ditolak.sort(key=lambda x: x[0])
+    return HasilPenilaian(dinilai, ditolak, indeks)
+
+
+def score_candidates(calon_list, model: ModelIDF, energi=None) -> list:
+    """Hanya daftar ScoredCandidate (tanpa catatan penolakan). Lihat nilai_calon()."""
+    return nilai_calon(calon_list, model, energi).dinilai
+
+
+# ===========================================================================
 # DEMO: python -m core.scoring
 # ===========================================================================
 def _calon_dari_kata(kata: list) -> Candidate:
@@ -776,6 +854,26 @@ def _demo() -> int:
     rusak = trend_scores([c for _, c in kasus_trend[:2]], EnergyProfile(step=1.0, values=[1.0, float("nan")]))
     print(f"  Profil energi rusak (NaN): valid={[r.valid for r in rusak]}, skor={[r.skor for r in rusak]}")
 
+    # ---------------- SKOR AKHIR ----------------
+    print("\nSKOR AKHIR 0-100: 0,30 Hook + 0,25 Flow + 0,25 Value + 0,20 Trend")
+    kuat = Candidate(_rangkai_kalimat([
+        "Tahukah kamu 3 rahasia fotosintesis yang luar biasa?",
+        "Astronomi mempelajari galaksi, bintang, dan nebula di langit malam!"], mulai=40.0))
+    datar = Candidate(_rangkai_kalimat([
+        "Kita dan yang itu kita dan yang itu.",
+        "Kita dan yang itu kita dan yang itu lagi."], mulai=0.0))
+    kasus_akhir = [("Calon kuat (hook + energi tinggi)", kuat), ("Calon datar (energi rendah)", datar),
+                   ("Calon tanpa kalimat", Candidate([])), ("Di luar cakupan profil (150 dtk)", _calon_waktu(biasa50, 150.0))]
+    hp = nilai_calon([c for _, c in kasus_akhir], model, energi)
+    nama_akhir = [n for n, _ in kasus_akhir]
+    print(f"  {'kasus':<36}{'hook':>6}{'flow':>6}{'value':>7}{'trend':>7}{'SKOR':>7}  nilai")
+    for i, s in zip(hp.indeks_dinilai, hp.dinilai):
+        print(f"  {nama_akhir[i]:<36}{s.hook:>6.2f}{s.flow:>6.2f}{s.value:>7.2f}{s.trend:>7.2f}{s.score:>7.1f}  {nilai_huruf(s.score)}")
+    for i, alasan in hp.ditolak:
+        print(f"  {nama_akhir[i]:<36}DIBUANG: {alasan[0]}")
+    kecil = nilai_calon([kuat, datar], build_idf(korpus[:3]), energi)
+    print(f"  Korpus hanya 3 kalimat -> dinilai={len(kecil.dinilai)}, dibuang={len(kecil.ditolak)}")
+
     # ---------------- RINGKASAN ----------------
     def cek(keterangan: str, kondisi: bool) -> None:
         nonlocal ok_semua
@@ -832,6 +930,18 @@ def _demo() -> int:
     cek("21. Di luar cakupan ditolak; bobot Trend = 1; semua skor 0..1",
         (not rt["Di luar cakupan profil (150 dtk)"].valid) and abs(sum(BOBOT_TREND.values()) - 1.0) < 1e-9
         and all(0.0 <= s <= 1.0 for s in semua_vt))
+    sk = {nama_akhir[i]: s for i, s in zip(hp.indeks_dinilai, hp.dinilai)}
+    cek("22. Jumlah bobot skor akhir = 1", abs(sum(BOBOT_AKHIR.values()) - 1.0) < 1e-9)
+    cek("23. Calon kuat bernilai lebih tinggi daripada calon datar",
+        sk["Calon kuat (hook + energi tinggi)"].score > sk["Calon datar (energi rendah)"].score)
+    cek("24. Calon tidak valid dan di luar cakupan dibuang (tercatat), tidak diberi skor",
+        sorted(i for i, _ in hp.ditolak) == [2, 3] and len(hp.dinilai) == 2)
+    cek("25. Semua skor akhir 0-100 dan sama dengan 100 x jumlah bobot x komponen",
+        all(0.0 <= s.score <= 100.0 and abs(s.score - 100 * (BOBOT_AKHIR["hook"] * s.hook + BOBOT_AKHIR["flow"] * s.flow
+            + BOBOT_AKHIR["value"] * s.value + BOBOT_AKHIR["trend"] * s.trend)) < 1e-9 for s in hp.dinilai))
+    cek("26. Huruf nilai (100=A, 65=B, 0=D); korpus kecil dan masukan kosong tidak crash",
+        nilai_huruf(100.0) == "A" and nilai_huruf(65.0) == "B" and nilai_huruf(0.0) == "D"
+        and len(kecil.dinilai) == 0 and len(kecil.ditolak) == 2 and nilai_calon([], model).dinilai == [])
     return 0 if ok_semua else 1
 
 
