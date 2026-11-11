@@ -9,6 +9,11 @@ Cara mencoba tanpa video (data contoh bawaan):
 """
 from .models import TANDA_AKHIR, Candidate, Sentence, Word
 
+# Jeda antar kalimat terpanjang yang masih boleh berada di dalam satu calon clip.
+# EKSPERIMENTAL: pada dua video uji, jeda wajar maksimal 3,1 dtk dan anomali 31 dtk,
+# jadi 10 dtk memisahkan keduanya. Perlu diuji pada lebih banyak video.
+JEDA_MAKS_CALON_BAWAAN = 10.0
+
 
 def split_sentences(words: list[Word], jeda_maks: float = 0.8) -> list[Sentence]:
     """Memecah kata menjadi kalimat.
@@ -41,6 +46,7 @@ def build_candidates(
     min_sec: float = 20,
     max_sec: float = 60,
     per_start: int = 3,
+    jeda_maks_calon: float | None = JEDA_MAKS_CALON_BAWAAN,
 ) -> list[Candidate]:
     """Menyusun calon clip dari kalimat-kalimat berurutan.
 
@@ -50,14 +56,27 @@ def build_candidates(
 
     Awal dan akhir calon clip selalu batas kalimat, jadi clip tidak terpotong
     di tengah kalimat.
+
+    `jeda_maks_calon` (detik): calon yang memuat jeda antar kalimat LEBIH PANJANG
+    dari ini tidak dibuat. Alasannya, klip yang berisi diam panjang (intro, musik,
+    bagian tanpa bicara) bukan klip yang layak, dan scoring hanya menghukumnya
+    terbatas. Nilai None mematikan aturan ini (perilaku lama). Nilai bawaan
+    adalah parameter EKSPERIMENTAL, bukan angka dari literatur.
     """
     if min_sec > max_sec:
         raise ValueError("min_sec tidak boleh lebih besar dari max_sec")
+    if jeda_maks_calon is not None and jeda_maks_calon <= 0:
+        raise ValueError("jeda_maks_calon harus > 0 atau None")
 
     hasil: list[Candidate] = []
     for awal in range(len(sentences)):
         terambil = 0
         for akhir in range(awal, len(sentences)):
+            # Jeda panjang di antara dua kalimat: semua calon yang lebih panjang dari
+            # titik ini juga memuatnya, jadi pembentukan dari awal ini dihentikan.
+            if (jeda_maks_calon is not None and akhir > awal
+                    and sentences[akhir].start - sentences[akhir - 1].end > jeda_maks_calon):
+                break
             durasi = sentences[akhir].end - sentences[awal].start
             if durasi > max_sec:
                 break

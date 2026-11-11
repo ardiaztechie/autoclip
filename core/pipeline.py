@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .audio import hitung_energi
 from .scoring import build_idf, nilai_calon, nilai_huruf
-from .segments import build_candidates, split_sentences
+from .segments import JEDA_MAKS_CALON_BAWAAN, build_candidates, split_sentences
 from .selection import pilih_klip
 from .transcribe import dari_json
 
@@ -37,10 +37,17 @@ class HasilRantai:
     energi_dipakai: bool
 
 
-def jalankan_rantai(kata, n: int = 3, energi=None) -> HasilRantai:
-    """kata: list[Word]. Mengembalikan ringkasan tiap tahap dan klip terpilih."""
+def jalankan_rantai(kata, n: int = 3, energi=None, *, min_detik: float = 20, maks_detik: float = 60,
+                    jeda_maks_calon: float | None = JEDA_MAKS_CALON_BAWAAN) -> HasilRantai:
+    """kata: list[Word]. Mengembalikan ringkasan tiap tahap dan klip terpilih.
+
+    min_detik dan maks_detik = rentang durasi calon klip (bawaan 20-60 dtk, sesuai rencana).
+    jeda_maks_calon = calon yang memuat jeda antar kalimat lebih panjang dari ini tidak dibuat
+    (None = mati, perilaku lama)."""
+    if not (min_detik > 0 and maks_detik >= min_detik):
+        raise ValueError("durasi harus: 0 < min_detik <= maks_detik")
     kalimat = split_sentences(kata)
-    calon = build_candidates(kalimat)
+    calon = build_candidates(kalimat, min_sec=min_detik, max_sec=maks_detik, jeda_maks_calon=jeda_maks_calon)
     model = build_idf(kalimat)
     penilaian = nilai_calon(calon, model, energi)
     seleksi = pilih_klip(penilaian.dinilai, n)
@@ -90,13 +97,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Rantai terminal: kata -> klip terpilih.")
     ap.add_argument("kata_json", help="berkas JSON hasil core.transcribe --simpan")
     ap.add_argument("--n", type=int, default=3, help="jumlah klip (bawaan 3)")
+    ap.add_argument("--min-detik", type=float, default=20, help="durasi klip minimum (bawaan 20)")
+    ap.add_argument("--maks-detik", type=float, default=60, help="durasi klip maksimum (bawaan 60)")
+    ap.add_argument("--jeda-maks-calon", type=float, default=JEDA_MAKS_CALON_BAWAAN,
+                    help=f"calon yang memuat jeda antar kalimat lebih panjang dari ini (dtk) tidak dibuat; "
+                         f"0 = mati, perilaku lama (bawaan {JEDA_MAKS_CALON_BAWAAN:g}, eksperimental)")
     ap.add_argument("--media", default=None, help="video/audio asal transkrip, untuk menghitung energi suara")
     ap.add_argument("--simpan", default=None, help="simpan klip terpilih ke berkas JSON")
     arg = ap.parse_args(argv)
     try:
         kata = dari_json(Path(arg.kata_json).read_text(encoding="utf-8"))
         energi = hitung_energi(arg.media) if arg.media else None
-        hasil = jalankan_rantai(kata, arg.n, energi)
+        hasil = jalankan_rantai(kata, arg.n, energi, min_detik=arg.min_detik, maks_detik=arg.maks_detik,
+                                jeda_maks_calon=arg.jeda_maks_calon if arg.jeda_maks_calon > 0 else None)
     except (OSError, ValueError, RuntimeError) as e:
         print(f"[GAGAL] {e}")
         return 1
