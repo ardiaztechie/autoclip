@@ -62,12 +62,32 @@ class Jalur:
     tinggi_frame: int
     rasio: str
     persen_berwajah: float  # 0-1: porsi sampel yang ada wajahnya
+    selang_lebar: tuple = ()  # [(awal, akhir)] detik: tampilkan seluruh bingkai (bukan potongan)
+    selang_zoom: tuple = ()   # [(awal, akhir)] detik: zoom in penekanan (potong langsung)
+    faktor_zoom: float = 1.0  # jendela dipersempit menjadi 1/faktor selama selang_zoom
+    titik_zoom: tuple = ()    # [(waktu, pusat_x, pusat_y)] pusat zoom (wajah pembicara); kosong = tengah jendela
 
     def pada(self, t: float):
         """Posisi (x_kiri, y_atas) pada waktu t, interpolasi linear; di luar rentang = ujungnya."""
         p = self.titik
         if not p:
             return (0.0, 0.0)
+        if t <= p[0][0]:
+            return (p[0][1], p[0][2])
+        if t >= p[-1][0]:
+            return (p[-1][1], p[-1][2])
+        for (t0, x0, y0), (t1, x1, y1) in zip(p, p[1:]):
+            if t0 <= t <= t1:
+                f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                return (x0 + f * (x1 - x0), y0 + f * (y1 - y0))
+        return (p[-1][1], p[-1][2])
+
+    def pusat_zoom(self, t: float):
+        """Pusat zoom (x, y) pada waktu t: wajah pembicara bila ada, selain itu tengah jendela potong."""
+        p = self.titik_zoom
+        if not p:
+            x, y = self.pada(t)
+            return (x + self.lebar_potong / 2, y + self.tinggi_potong / 2)
         if t <= p[0][0]:
             return (p[0][1], p[0][2])
         if t >= p[-1][0]:
