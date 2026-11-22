@@ -21,8 +21,34 @@ from pathlib import Path
 from .audio import hitung_energi
 from .scoring import build_idf, nilai_calon, nilai_huruf
 from .segments import JEDA_MAKS_CALON_BAWAAN, build_candidates, split_sentences
+from .varian import JUMLAH_BAND_BAWAAN, build_candidates_varian
 from .selection import pilih_klip
 from .transcribe import dari_json
+
+
+# --- Parameter eksperimental (belum punya dasar riset; disetel dari uji) -----------------
+DETIK_PER_KLIP_BAWAAN = 75.0         # jumlah klip otomatis = durasi video / angka ini (tebakan, perlu disetel)
+TINGKAT_JUMLAH = {                   # "sedikit/sedang/banyak" -> detik video per klip (tebakan)
+    "jarang": 120.0,
+    "sedang": DETIK_PER_KLIP_BAWAAN,
+    "rapat": 50.0,
+}
+TOLERANSI_OTOMATIS = 20.0            # detik di atas maks pada durasi "otomatis" (keputusan user)
+PRESET_DURASI = {                    # nama -> (min_detik, maks_detik)
+    "otomatis": (30.0, 60.0),        # bawaan: + toleransi 20 dtk (maks 80), mode calon varian
+    "pendek": (15.0, 30.0),
+    "sedang": (30.0, 60.0),
+    "panjang": (60.0, 90.0),
+}
+
+
+def jumlah_klip_otomatis(durasi_video_detik: float, detik_per_klip: float = DETIK_PER_KLIP_BAWAAN) -> int:
+    """Jumlah klip menurut durasi video: 1 klip per `detik_per_klip` detik, minimal 1."""
+    if not (detik_per_klip > 0):
+        raise ValueError("detik_per_klip harus > 0")
+    if not (durasi_video_detik >= 0):
+        raise ValueError("durasi video tidak boleh negatif")
+    return max(1, int(durasi_video_detik / detik_per_klip))
 
 
 @dataclass(frozen=True)
@@ -38,16 +64,26 @@ class HasilRantai:
 
 
 def jalankan_rantai(kata, n: int = 3, energi=None, *, min_detik: float = 20, maks_detik: float = 60,
-                    jeda_maks_calon: float | None = JEDA_MAKS_CALON_BAWAAN) -> HasilRantai:
+                    jeda_maks_calon: float | None = JEDA_MAKS_CALON_BAWAAN,
+                    mode_calon: str = "lama", jumlah_band: int = JUMLAH_BAND_BAWAAN,
+                    toleransi: float = 0.0) -> HasilRantai:
     """kata: list[Word]. Mengembalikan ringkasan tiap tahap dan klip terpilih.
 
     min_detik dan maks_detik = rentang durasi calon klip (bawaan 20-60 dtk, sesuai rencana).
     jeda_maks_calon = calon yang memuat jeda antar kalimat lebih panjang dari ini tidak dibuat
-    (None = mati, perilaku lama)."""
+    (None = mati, perilaku lama).
+    mode_calon: "lama" (bawaan, per_start=3) atau "varian" (perbaikan B, EKSPERIMENTAL: beberapa panjang
+    per titik awal; lihat core/varian.py). jumlah_band dan toleransi hanya dipakai pada mode "varian"."""
+    if mode_calon not in ("lama", "varian"):
+        raise ValueError("mode_calon harus 'lama' atau 'varian'")
     if not (min_detik > 0 and maks_detik >= min_detik):
         raise ValueError("durasi harus: 0 < min_detik <= maks_detik")
     kalimat = split_sentences(kata)
-    calon = build_candidates(kalimat, min_sec=min_detik, max_sec=maks_detik, jeda_maks_calon=jeda_maks_calon)
+    if mode_calon == "varian":
+        calon = build_candidates_varian(kalimat, min_sec=min_detik, max_sec=maks_detik, jumlah_band=jumlah_band,
+                                        jeda_maks_calon=jeda_maks_calon, toleransi_sec=toleransi)
+    else:
+        calon = build_candidates(kalimat, min_sec=min_detik, max_sec=maks_detik, jeda_maks_calon=jeda_maks_calon)
     model = build_idf(kalimat)
     penilaian = nilai_calon(calon, model, energi)
     seleksi = pilih_klip(penilaian.dinilai, n)
@@ -96,20 +132,42 @@ def _tampil(h: HasilRantai) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Rantai terminal: kata -> klip terpilih.")
     ap.add_argument("kata_json", help="berkas JSON hasil core.transcribe --simpan")
-    ap.add_argument("--n", type=int, default=3, help="jumlah klip (bawaan 3)")
-    ap.add_argument("--min-detik", type=float, default=20, help="durasi klip minimum (bawaan 20)")
-    ap.add_argument("--maks-detik", type=float, default=60, help="durasi klip maksimum (bawaan 60)")
+    ap.add_argument("--n", type=int, default=None,
+                    help=f"jumlah klip; kosong = otomatis menurut --tingkat (eksperimental)")
+    ap.add_argument("--tingkat", choices=tuple(TINGKAT_JUMLAH), default="sedang",
+                    help="dipakai bila --n kosong: jarang=1 klip/120 dtk video, sedang=1/75 dtk, rapat=1/50 dtk (tebakan)")
+    ap.add_argument("--durasi", choices=tuple(PRESET_DURASI), default="otomatis",
+                    help="otomatis (bawaan) = 30-60 dtk + toleransi 20; pendek 15-30; sedang 30-60; panjang 60-90 dtk. "
+                         "Isi --min-detik/--maks-detik sendiri untuk angka bebas (menggantikan pilihan ini)")
+    ap.add_argument("--min-detik", type=float, default=None, help="durasi klip minimum (angka bebas)")
+    ap.add_argument("--maks-detik", type=float, default=None, help="durasi klip maksimum (angka bebas)")
     ap.add_argument("--jeda-maks-calon", type=float, default=JEDA_MAKS_CALON_BAWAAN,
                     help=f"calon yang memuat jeda antar kalimat lebih panjang dari ini (dtk) tidak dibuat; "
                          f"0 = mati, perilaku lama (bawaan {JEDA_MAKS_CALON_BAWAAN:g}, eksperimental)")
+    ap.add_argument("--mode-calon", choices=("lama", "varian"), default="varian",
+                    help="varian (bawaan CLI) = beberapa panjang per titik awal (EKSPERIMENTAL); lama = per_start=3")
+    ap.add_argument("--varian", type=int, default=JUMLAH_BAND_BAWAAN,
+                    help=f"jumlah pita durasi pada mode varian (bawaan {JUMLAH_BAND_BAWAAN}, hipotesis)")
+    ap.add_argument("--toleransi", type=float, default=None,
+                    help="mode varian: detik di atas maks yang boleh dipakai bila batasnya sangat baik "
+                         f"(bawaan: {TOLERANSI_OTOMATIS:g} untuk durasi otomatis, 0 untuk pilihan lain)")
     ap.add_argument("--media", default=None, help="video/audio asal transkrip, untuk menghitung energi suara")
     ap.add_argument("--simpan", default=None, help="simpan klip terpilih ke berkas JSON")
     arg = ap.parse_args(argv)
     try:
         kata = dari_json(Path(arg.kata_json).read_text(encoding="utf-8"))
         energi = hitung_energi(arg.media) if arg.media else None
-        hasil = jalankan_rantai(kata, arg.n, energi, min_detik=arg.min_detik, maks_detik=arg.maks_detik,
-                                jeda_maks_calon=arg.jeda_maks_calon if arg.jeda_maks_calon > 0 else None)
+        n = arg.n if arg.n is not None else jumlah_klip_otomatis(kata[-1].end if kata else 0.0, TINGKAT_JUMLAH[arg.tingkat])
+        if arg.min_detik is not None or arg.maks_detik is not None:
+            mn = arg.min_detik if arg.min_detik is not None else 20.0
+            mk = arg.maks_detik if arg.maks_detik is not None else 60.0
+        else:
+            mn, mk = PRESET_DURASI[arg.durasi]
+        tol = arg.toleransi if arg.toleransi is not None else (
+            TOLERANSI_OTOMATIS if arg.durasi == "otomatis" and arg.min_detik is None and arg.maks_detik is None else 0.0)
+        hasil = jalankan_rantai(kata, n, energi, min_detik=mn, maks_detik=mk,
+                                jeda_maks_calon=arg.jeda_maks_calon if arg.jeda_maks_calon > 0 else None,
+                                mode_calon=arg.mode_calon, jumlah_band=arg.varian, toleransi=tol)
     except (OSError, ValueError, RuntimeError) as e:
         print(f"[GAGAL] {e}")
         return 1
