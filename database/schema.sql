@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS projects (
   source_ref     VARCHAR(500) NOT NULL DEFAULT '',        -- nama file atau tautan
   language       VARCHAR(10) NOT NULL DEFAULT 'auto',     -- 'auto' = dideteksi Whisper
   ratio          ENUM('9:16','1:1','4:5') NOT NULL DEFAULT '9:16',
-  n_clips        TINYINT UNSIGNED NOT NULL DEFAULT 3,
+  n_clips        TINYINT UNSIGNED NULL,                   -- NULL = otomatis menurut durasi video dan clip_density
+  clip_density   ENUM('jarang','sedang','rapat') NOT NULL DEFAULT 'sedang',   -- dipakai bila n_clips NULL
+  clip_length    ENUM('otomatis','pendek','sedang','panjang') NOT NULL DEFAULT 'otomatis',
   face_tracking  TINYINT(1) NOT NULL DEFAULT 1,
   status         ENUM('queued','processing','done','failed') NOT NULL DEFAULT 'queued',
   stage          VARCHAR(60) NOT NULL DEFAULT 'Antre',    -- contoh: 'Transkripsi'

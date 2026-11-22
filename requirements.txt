@@ -18,3 +18,4 @@
 
    # Tes
    pytest>=8
+   httpx>=0.27          # hanya untuk tes endpoint (fastapi.testclient)
