@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from . import api_klip, api_proyek, auth
+from . import api_klip, api_proyek, auth, landing
 from .db import cek_database
 from .konteks import GalatKonfigurasi, Konteks
 
@@ -44,6 +44,7 @@ def buat_app(cek_db=None, *, konteks=None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(api_proyek.router)
     app.include_router(api_klip.router)
+    app.include_router(landing.router)
 
     @app.get("/health")
     def health():

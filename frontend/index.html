@@ -1,11 +1,23 @@
 <!doctype html>
-<html lang="id">
+<html lang="id" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#09090b" />
     <title>AutoClip</title>
+    <script>
+      // Pasang tema sebelum tampilan digambar, supaya tidak berkedip.
+      (function () {
+        try {
+          var t = localStorage.getItem("autoclip-tema");
+          var terang = t === "terang" || (t !== "gelap" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+          document.documentElement.classList.toggle("terang", terang);
+          document.documentElement.classList.toggle("dark", !terang);
+        } catch (e) {}
+      })();
+    </script>
   </head>
-  <body class="bg-slate-50 text-slate-800">
+  <body class="bg-zinc-950 text-zinc-200 antialiased">
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>

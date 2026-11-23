@@ -30,7 +30,8 @@ TABEL = [
       score REAL NOT NULL DEFAULT 0, hook REAL NOT NULL DEFAULT 0, flow REAL NOT NULL DEFAULT 0,
       value_score REAL NOT NULL DEFAULT 0, trend REAL NOT NULL DEFAULT 0, title TEXT NOT NULL DEFAULT '', titles TEXT,
       caption TEXT NOT NULL DEFAULT '', hashtags TEXT, ratio TEXT NOT NULL DEFAULT '9:16',
-      status TEXT NOT NULL DEFAULT 'queued', file_path TEXT, size_bytes INTEGER, render_seconds REAL)""",
+      status TEXT NOT NULL DEFAULT 'queued', file_path TEXT, size_bytes INTEGER, render_seconds REAL,
+      edit_count INTEGER NOT NULL DEFAULT 0, edit_settings TEXT)""",
     """CREATE TABLE job_metrics (
       id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, project_id INTEGER, stage TEXT NOT NULL,
       seconds REAL NOT NULL, peak_ram_mb REAL, video_seconds REAL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""",
@@ -101,9 +102,9 @@ def cfg(tmp_path):
     return {"folder": tmp_path / "storage", "maks_bytes": 10**9}
 
 
-def _proyek(engine, cfg, *, ratio="9:16", n=2, bahasa="auto", wajah=True, sumber=True):
+def _proyek(engine, cfg, *, ratio="9:16", n=2, bahasa="auto", wajah=True, sumber=True, panjang="otomatis"):
     with engine.begin() as k:
-        pid = proyek.buat(k, 1, "Judul", "a.mp4", bahasa, ratio, n, wajah)
+        pid = proyek.buat(k, 1, "Judul", "a.mp4", bahasa, ratio, n, wajah, panjang=panjang)
         jid = proyek.antrekan(k, pid)
     if sumber:
         folder = cfg["folder"] / "projects" / str(pid)
@@ -246,7 +247,7 @@ def test_ambil_kalah_balapan_dengan_worker_lain(engine, cfg):
 
 def test_ambil_hanya_jenis_yang_didukung(engine):
     with engine.begin() as k:
-        k.execute(text("INSERT INTO job_queue (type, payload) VALUES ('render_clip', '{\"clip_id\": 1}')"))
+        k.execute(text("INSERT INTO job_queue (type, payload) VALUES ('jenis_asing', '{\"clip_id\": 1}')"))
     assert _ambil(engine) is None
     assert _satu(engine, "SELECT status FROM job_queue")[0] == "queued"
 
@@ -338,7 +339,7 @@ def test_gagal_kode_bukan_nol_memakai_pesan_gagal_dari_keluaran(engine, cfg):
 def test_gagal_tanpa_pesan_memakai_kode(engine, cfg):
     pid, _ = _proyek(engine, cfg)
     _kerjakan(engine, cfg, Penjalan(baris=["noise"], kode=3, klip=None, meta=None, mp4=0))
-    assert _proyek_baris(engine, pid)[3] == "Pemrosesan gagal (kode 3)"
+    assert _proyek_baris(engine, pid)[3] == "Pemrosesan gagal (kode 3): noise"
 
 
 def test_pesan_gagal_tidak_membocorkan_lokasi_server(engine, cfg):
@@ -392,6 +393,31 @@ def test_durasi_melebihi_batas_ditolak_sebelum_diproses(engine, cfg):
     baris = _proyek_baris(engine, pid)
     assert baris[0] == "failed" and "25.0 menit" in baris[3] and "20 menit" in baris[3] and baris[4] == 1500.0
     assert _kerjakan_ulang_batas(engine, cfg) is True                        # tepat di batas masih boleh
+
+
+def test_video_lebih_pendek_dari_durasi_klip_pilihan_ditolak(engine, cfg):
+    pid, _ = _proyek(engine, cfg, panjang="sangat_panjang")
+    pj = Penjalan()
+    assert _kerjakan(engine, cfg, pj, durasi=lambda p: 80.0) is False and pj.dipanggil == 0
+    baris = _proyek_baris(engine, pid)
+    assert baris[0] == "failed" and "80 detik" in baris[3] and "Sangat panjang" in baris[3] and "90 detik" in baris[3]
+    assert "Pilih durasi klip yang lebih pendek" in baris[3]
+
+
+@pytest.mark.parametrize("panjang,detik,lolos", [
+    ("sangat_panjang", 90.0, True), ("sangat_panjang", 89.0, False), ("ekstra_panjang", 120.0, True),
+    ("ekstra_panjang", 119.0, False), ("panjang", 59.0, False), ("panjang", 60.0, True),
+    ("sedang", 29.0, False), ("pendek", 15.0, True), ("pendek", 14.0, False), ("otomatis", 29.0, False),
+])
+def test_batas_minimal_tiap_pilihan_durasi(engine, cfg, panjang, detik, lolos):
+    _proyek(engine, cfg, panjang=panjang)
+    assert _kerjakan(engine, cfg, Penjalan(), durasi=lambda p: detik) is lolos
+
+
+def test_batas_minimal_sama_dengan_preset_di_core():
+    from core.pipeline import PRESET_DURASI
+    assert set(proyek.MIN_DETIK_PANJANG) == set(proyek.PANJANG_KLIP) == set(PRESET_DURASI)
+    assert {k: v[0] for k, v in PRESET_DURASI.items()} == proyek.MIN_DETIK_PANJANG
 
 
 def _kerjakan_ulang_batas(engine, cfg):
@@ -763,3 +789,411 @@ def test_batas_tetap_berlaku_bila_diisi(engine, cfg):
     job = _ambil(engine)
     assert worker.kerjakan(engine, job, cfg, {"maks_durasi_detik": 60.0}, runner=Penjalan(), durasi=lambda p: 61.0) is False
     assert "melebihi batas 1 menit" in _proyek_baris(engine, pid)[3]
+
+
+# ---------------------------------------------------------------- pesan bila proses berhenti tanpa [GAGAL]
+def test_kode_keluar_menyertakan_baris_terakhir_keluaran(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    pj = Penjalan(baris=["=== Langkah 1/4: transkripsi ===", "usage: jalankan [-h] video",
+                          "jalankan: error: unrecognized arguments: --tingkat sedang", ""], kode=2, klip=None, meta=None, mp4=0)
+    assert _kerjakan(engine, cfg, pj) is False
+    assert _proyek_baris(engine, pid)[3] == "Pemrosesan gagal (kode 2): jalankan: error: unrecognized arguments: --tingkat sedang"
+
+
+def test_kode_keluar_tanpa_keluaran_tetap_ada_pesan(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    assert _kerjakan(engine, cfg, Penjalan(baris=[], kode=3, klip=None, meta=None, mp4=0)) is False
+    assert _proyek_baris(engine, pid)[3] == "Pemrosesan gagal (kode 3)"
+
+
+def test_kode_keluar_membuang_lokasi_server_dan_memotong(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    lokasi = str(cfg["folder"] / "projects" / "1" / "source.mp4")
+    pj = Penjalan(baris=[f"FileNotFoundError: {lokasi} " + "x" * 500], kode=1, klip=None, meta=None, mp4=0)
+    _kerjakan(engine, cfg, pj)
+    pesan = _proyek_baris(engine, pid)[3]
+    assert str(cfg["folder"]) not in pesan and "storage" in pesan and len(pesan) <= len("Pemrosesan gagal (kode 1): ") + 300
+
+
+def test_baris_gagal_tetap_didahulukan_atas_baris_terakhir(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    pj = Penjalan(baris=["[GAGAL] Tidak ada kata terdeteksi", "Traceback ... lain"], kode=1, klip=None, meta=None, mp4=0)
+    _kerjakan(engine, cfg, pj)
+    assert _proyek_baris(engine, pid)[3] == "Tidak ada kata terdeteksi"
+
+
+# ---------------------------------------------------------------- render ulang satu klip
+def _proyek_selesai_dengan_klip(engine, cfg, *, wajah=True):
+    """Proyek selesai berisi satu klip jadi (file lama berisi b'lama') dan video sumber."""
+    pid, _ = _proyek(engine, cfg, n=1, wajah=wajah)
+    with engine.begin() as k:
+        k.execute(text("DELETE FROM job_queue"))
+        proyek.ubah(k, pid, status="done", stage="Selesai", progress=100)
+        proyek.simpan_klip(k, pid, "9:16", [{"start": 10.0, "end": 40.0, "score": 70.0, "hook": .5, "flow": .5, "value": .5,
+                                             "trend": .5, "title": "J", "caption": "C", "hashtags": [],
+                                             "file_path": f"projects/{pid}/hasil/klip_01_9x16.mp4", "size_bytes": 4}])
+    hasil = cfg["folder"] / "projects" / str(pid) / "hasil"
+    hasil.mkdir(parents=True, exist_ok=True)
+    (hasil / "klip_01_9x16.mp4").write_bytes(b"lama")
+    cid = _satu(engine, "SELECT id FROM clips WHERE project_id = :p", p=pid)[0]
+    return pid, cid, hasil
+
+
+def _jadwalkan(engine, pid, cid, mulai=12.0, akhir=50.0):
+    with engine.begin() as k:
+        proyek.jadwalkan_render_ulang(k, pid, cid, mulai, akhir)
+
+
+class PenjalanKlip:
+    def __init__(self, kode=0, tulis=True, baris=()):
+        self.kode, self.tulis, self.baris, self.argv = kode, tulis, baris, None
+
+    def __call__(self, argv, cwd, kirim):
+        self.argv = argv
+        for b in self.baris:
+            kirim(b)
+        if self.tulis and self.kode == 0:
+            folder = Path(argv[argv.index("--folder") + 1])
+            (folder / "klip_01_9x16.mp4").write_bytes(b"baru-baru")
+        return self.kode
+
+
+def test_render_ulang_mengganti_berkas_dan_batas_klip_tanpa_menyentuh_proyek(engine, cfg):
+    pid, cid, hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid, 12.0, 50.0)
+    assert _satu(engine, "SELECT status FROM clips WHERE id = :i", i=cid)[0] == "rendering"
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert (hasil / "klip_01_9x16.mp4").read_bytes() == b"baru-baru"
+    assert _satu(engine, "SELECT status, start_sec, end_sec, size_bytes FROM clips WHERE id = :i", i=cid) == ("done", 12.0, 50.0, 9)
+    assert _proyek_baris(engine, pid)[0] == "done"
+    assert _satu(engine, "SELECT status FROM job_queue")[0] == "done"
+    assert not list(hasil.glob("_ulang_*"))                                                   # folder sementara dibersihkan
+    assert pj.argv[1:3] == ["-m", "core.render"] and "--mode" not in pj.argv
+    assert not Path(pj.argv[4]).exists()                                                      # klip.json sementara sudah hilang
+
+
+def test_render_ulang_tanpa_wajah_memakai_mode_tengah_dan_subtitle_bila_ada(engine, cfg):
+    pid, cid, hasil = _proyek_selesai_dengan_klip(engine, cfg, wajah=False)
+    (hasil / "kata.json").write_text("[]", encoding="utf-8")
+    _jadwalkan(engine, pid, cid)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert pj.argv[pj.argv.index("--mode") + 1] == "tengah" and pj.argv[pj.argv.index("--kata") + 1].endswith("kata.json")
+
+
+def test_render_ulang_gagal_berkas_lama_utuh_klip_failed_proyek_tetap_selesai(engine, cfg):
+    pid, cid, hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+    assert not _kerjakan(engine, cfg, PenjalanKlip(kode=1, baris=["[GAGAL] ffmpeg rusak"]))
+    assert (hasil / "klip_01_9x16.mp4").read_bytes() == b"lama"
+    assert _satu(engine, "SELECT status, start_sec, end_sec FROM clips WHERE id = :i", i=cid) == ("failed", 10.0, 40.0)
+    assert _proyek_baris(engine, pid)[0] == "done"
+    status, galat = _satu(engine, "SELECT status, error FROM job_queue")
+    assert status == "failed" and "ffmpeg rusak" in galat
+
+
+def test_render_ulang_video_sumber_hilang_dan_berkas_tidak_dihasilkan(engine, cfg):
+    pid, cid, hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+    assert not _kerjakan(engine, cfg, PenjalanKlip(tulis=False))
+    assert "tidak menghasilkan" in _satu(engine, "SELECT error FROM job_queue ORDER BY id DESC LIMIT 1")[0]
+    (cfg["folder"] / "projects" / str(pid) / "source.mp4").unlink()
+    _jadwalkan(engine, pid, cid)
+    assert not _kerjakan(engine, cfg, PenjalanKlip())
+    assert "sumber" in _satu(engine, "SELECT error FROM job_queue WHERE status = 'failed' ORDER BY id DESC LIMIT 1")[0]
+
+
+def test_render_ulang_isi_pekerjaan_tidak_valid_dan_pemulihan(engine, cfg):
+    pid, cid, hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    with engine.begin() as k:
+        k.execute(text("INSERT INTO job_queue (type, payload) VALUES ('render_clip', :p)"),
+                  {"p": json.dumps({"project_id": pid, "clip_id": cid, "mulai": 30, "akhir": 10})})
+    assert not _kerjakan(engine, cfg, PenjalanKlip())
+    # pemulihan: pekerjaan render_clip yang terputus diulang tanpa mengubah status proyek; setelah 3 kali, klip failed
+    with engine.begin() as k:
+        k.execute(text("UPDATE clips SET status = 'rendering' WHERE id = :i"), {"i": cid})
+        k.execute(text("INSERT INTO job_queue (type, payload, status, attempts) VALUES ('render_clip', :p, 'running', 3)"),
+                  {"p": json.dumps({"project_id": pid, "clip_id": cid, "mulai": 1, "akhir": 20})})
+    worker.pulihkan(engine)
+    assert _satu(engine, "SELECT status FROM clips WHERE id = :i", i=cid)[0] == "failed"
+    assert _proyek_baris(engine, pid)[0] == "done"
+
+
+# ---------------------------------------------------------------- batal render ulang
+def _batalkan(engine, pid, cid):
+    with engine.begin() as k:
+        return proyek.batalkan_render_ulang(k, pid, cid)
+
+
+def test_batal_sebelum_diambil_worker_klip_kembali_done_dan_pekerjaan_tidak_dikerjakan(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+    klip = _batalkan(engine, pid, cid)
+    assert klip["status"] == "done"
+    assert _ambil(engine) is None
+    assert _satu(engine, "SELECT status, error FROM job_queue")[:] == ("failed", "dibatalkan")
+    assert (folder_hasil / "klip_01_9x16.mp4").read_bytes() == b"lama"
+
+
+def test_batal_saat_worker_sudah_mengerjakan_berkas_lama_utuh_dan_status_tetap_done(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+    job = _ambil(engine)
+
+    class PenjalanDibatalkan(PenjalanKlip):
+        def __call__(self, argv, cwd, kirim):
+            _batalkan(engine, pid, cid)           # pengguna menekan batal selagi render berjalan
+            return super().__call__(argv, cwd, kirim)
+
+    assert worker.kerjakan(engine, job, cfg, PROSES_CFG, runner=PenjalanDibatalkan()) is False
+    assert (folder_hasil / "klip_01_9x16.mp4").read_bytes() == b"lama"
+    assert _satu(engine, "SELECT status, start_sec FROM clips WHERE id = :i", i=cid)[0] == "done"
+    assert _satu(engine, "SELECT status, error FROM job_queue")[:] == ("failed", "dibatalkan")
+    assert not (cfg["folder"] / "projects" / str(pid) / "hasil" / f"_ulang_{cid}").exists()
+    assert _satu(engine, "SELECT status FROM projects WHERE id = :i", i=pid)[0] == "done"
+
+
+def test_batal_klip_yang_tidak_sedang_dirender_ditolak(engine, cfg):
+    pid, cid, _ = _proyek_selesai_dengan_klip(engine, cfg)
+    with pytest.raises(RuntimeError):
+        _batalkan(engine, pid, cid)
+    with pytest.raises(LookupError):
+        _batalkan(engine, pid, 9999)
+
+
+def test_batal_tidak_menyentuh_pekerjaan_klip_lain(engine, cfg):
+    pid, cid, _ = _proyek_selesai_dengan_klip(engine, cfg)
+    with engine.begin() as k:
+        k.execute(text("INSERT INTO job_queue (type, payload) VALUES ('render_clip', :p)"),
+                  {"p": json.dumps({"project_id": pid, "clip_id": cid + 1, "mulai": 1.0, "akhir": 9.0})})
+    _jadwalkan(engine, pid, cid)
+    _batalkan(engine, pid, cid)
+    assert _satu(engine, "SELECT COUNT(*) FROM job_queue WHERE status = 'queued'")[0] == 1
+
+
+def test_jalankan_proses_nyata_berhenti_saat_dibatalkan(tmp_path):
+    import time as waktu
+    skrip = tmp_path / "lama.py"
+    skrip.write_text("import time\nprint('mulai', flush=True)\ntime.sleep(30)\n", encoding="utf-8")
+    mulai = waktu.monotonic()
+    kode = worker.jalankan_proses([worker.sys.executable, str(skrip)], tmp_path, lambda b: None, dibatalkan=lambda: True)
+    assert kode != 0 and waktu.monotonic() - mulai < 10
+
+
+def test_kemajuan_render_ulang_ditulis_ke_folder_sementara_dan_dibersihkan(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+    terbaca = []
+
+    class PenjalanLapor(PenjalanKlip):
+        def __call__(self, argv, cwd, kirim):
+            kirim("[PROGRES] 0 Menganalisis suara")
+            kirim("[PROGRES] 37 Merender video")
+            terbaca.append(json.loads((folder_hasil / f"_ulang_{cid}" / "progres.json").read_text(encoding="utf-8")))
+            return super().__call__(argv, cwd, kirim)
+
+    pj = PenjalanLapor(baris=("baris lain",))
+    assert _kerjakan(engine, cfg, pj)
+    assert terbaca[0]["persen"] == 37 and terbaca[0]["tahap"] == "Merender video" and terbaca[0]["berjalan"] >= 0
+    assert not (folder_hasil / f"_ulang_{cid}").exists()
+
+
+def test_baris_kemajuan_tidak_masuk_pesan_kegagalan(engine, cfg):
+    pid, cid, _ = _proyek_selesai_dengan_klip(engine, cfg)
+    _jadwalkan(engine, pid, cid)
+
+    class Gagal(PenjalanKlip):
+        def __call__(self, argv, cwd, kirim):
+            kirim("[PROGRES] 12 Melacak wajah dan pembicara")
+            kirim("Traceback: sesuatu rusak")
+            return 3
+
+    assert _kerjakan(engine, cfg, Gagal()) is False
+    galat = _satu(engine, "SELECT error FROM job_queue")[0]
+    assert "PROGRES" not in galat
+
+
+# ---------------------------------------------------------------- batal pemrosesan proyek penuh
+def _batalkan_proyek(engine, pid):
+    with engine.begin() as k:
+        return proyek.batalkan_proyek(k, pid, 1)
+
+
+def test_batal_proyek_sebelum_diambil_worker(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    hasil = _batalkan_proyek(engine, pid)
+    assert (hasil["status"], hasil["stage"]) == ("failed", "Dibatalkan")
+    assert _ambil(engine) is None
+
+
+def test_batal_proyek_saat_berjalan_status_tidak_ditimpa_dan_klip_tidak_disimpan(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    pj = Penjalan(pada_baris=None)
+    job = _ambil(engine)
+
+    class PenjalanDibatalkan(Penjalan):
+        def __call__(self, argv, cwd, kirim):
+            kirim("=== Langkah 1/4: transkripsi ===")
+            _batalkan_proyek(engine, pid)                    # pengguna menekan batal di tengah jalan
+            kirim("=== Langkah 2/4: pemilihan klip ===")      # pembaruan sesudahnya tidak boleh menimpa status
+            return 0
+
+    assert worker.kerjakan(engine, job, cfg, PROSES_CFG, runner=PenjalanDibatalkan(), durasi=lambda p: 180.0) is False
+    baris = _proyek_baris(engine, pid)
+    assert baris[0] == "failed" and baris[1] == "Dibatalkan" and baris[3] == "Dibatalkan oleh pengguna"
+    assert _satu(engine, "SELECT status, error FROM job_queue")[:] == ("failed", "dibatalkan")
+    assert _satu(engine, "SELECT COUNT(*) FROM clips")[0] == 0
+
+
+def test_batal_proyek_proses_dimatikan_kode_nonzero_tidak_dianggap_gagal_biasa(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    job = _ambil(engine)
+
+    class Dimatikan(Penjalan):
+        def __call__(self, argv, cwd, kirim):
+            _batalkan_proyek(engine, pid)
+            return -9                                         # seperti proses yang di-kill
+
+    assert worker.kerjakan(engine, job, cfg, PROSES_CFG, runner=Dimatikan(), durasi=lambda p: 180.0) is False
+    assert _proyek_baris(engine, pid)[1] == "Dibatalkan"
+    assert "kode" not in (_proyek_baris(engine, pid)[3] or "")
+
+
+def test_batal_proyek_yang_tidak_berjalan_atau_bukan_milik(engine, cfg):
+    pid, _ = _proyek(engine, cfg)
+    with engine.begin() as k:
+        k.execute(text("UPDATE projects SET status = 'done' WHERE id = :i"), {"i": pid})
+    with pytest.raises(RuntimeError):
+        _batalkan_proyek(engine, pid)
+    with pytest.raises(LookupError):
+        _batalkan_proyek(engine, 9999)
+    with engine.begin() as k, pytest.raises(LookupError):
+        proyek.batalkan_proyek(k, pid, 2)                    # pengguna lain
+
+
+# ---------------------------------------------------------------- gaya subtitle dan koreksi kata saat render ulang
+def _tulis_kata(folder_hasil, kata):
+    (folder_hasil / "kata.json").write_text(json.dumps(kata), encoding="utf-8")
+
+
+KATA = [{"w": "halo", "s": 12.0, "e": 12.4}, {"w": "dunia", "s": 12.5, "e": 13.0}, {"w": "ini", "s": 13.1, "e": 13.4}]
+
+
+def test_terapkan_koreksi_hanya_mengubah_kata_yang_cocok_dan_tidak_memutasi_asli():
+    asli = [dict(k) for k in KATA]
+    hasil = worker.terapkan_koreksi(KATA, [{"s": 12.5, "w": "Duniaku"}, {"s": 13.1, "w": ""}, {"s": 99.0, "w": "tak ada"}])
+    assert [k["w"] for k in hasil] == ["halo", "Duniaku", ""] and KATA == asli
+
+
+def test_render_ulang_memakai_gaya_dan_koreksi_klip_tanpa_mengubah_kata_json(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _tulis_kata(folder_hasil, KATA)
+    with engine.begin() as k:
+        proyek.simpan_subtitle(k, pid, cid, {"gaya": "sorot", "posisi": "tengah", "ukuran": "besar", "aktif": True},
+                               [{"s": 12.5, "w": "Duniaku"}])
+    _jadwalkan(engine, pid, cid)
+    diperiksa = []
+
+    class Periksa(PenjalanKlip):
+        def __call__(self, argv, cwd, kirim):
+            berkas = Path(argv[argv.index("--kata") + 1])
+            diperiksa.append(json.loads(berkas.read_text(encoding="utf-8")))
+            return super().__call__(argv, cwd, kirim)
+
+    pj = Periksa()
+    assert _kerjakan(engine, cfg, pj)
+    a = pj.argv
+    assert a[a.index("--gaya-teks") + 1] == "sorot" and a[a.index("--posisi-teks") + 1] == "tengah"
+    assert a[a.index("--ukuran-teks") + 1] == "besar" and "--tanpa-subtitle" not in a
+    assert [k["w"] for k in diperiksa[0]] == ["halo", "Duniaku", "ini"]
+    assert json.loads((folder_hasil / "kata.json").read_text(encoding="utf-8")) == KATA          # transkrip proyek utuh
+
+
+def test_render_ulang_subtitle_dimatikan_dan_tanpa_kata_json(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _tulis_kata(folder_hasil, KATA)
+    with engine.begin() as k:
+        proyek.simpan_subtitle(k, pid, cid, {"aktif": False})
+    _jadwalkan(engine, pid, cid)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert "--tanpa-subtitle" in pj.argv and "--kata" in pj.argv                                  # kata tetap dipakai pelacak
+    (folder_hasil / "kata.json").unlink()
+    _jadwalkan(engine, pid, cid)
+    pj2 = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj2)
+    assert "--kata" not in pj2.argv and "--gaya-teks" not in pj2.argv
+
+
+def test_render_ulang_koreksi_dengan_kata_json_rusak_memakai_transkrip_asli(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    (folder_hasil / "kata.json").write_text("{rusak", encoding="utf-8")
+    with engine.begin() as k:
+        proyek.simpan_subtitle(k, pid, cid, {}, [{"s": 12.5, "w": "x"}])
+    _jadwalkan(engine, pid, cid)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert Path(pj.argv[pj.argv.index("--kata") + 1]).name == "kata.json"
+
+
+def test_render_ulang_mencatat_gaya_yang_dibakar_dan_animasi_diteruskan(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _tulis_kata(folder_hasil, KATA)
+    with engine.begin() as k:
+        proyek.simpan_subtitle(k, pid, cid, {"gaya": "kuning", "animasi": "muncul"})
+        assert proyek.cari_klip(k, pid, cid)["subtitle_perlu_render"] is True
+    _jadwalkan(engine, pid, cid)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert pj.argv[pj.argv.index("--animasi-teks") + 1] == "muncul"
+    with engine.connect() as k:
+        klip = proyek.cari_klip(k, pid, cid)
+    assert klip["subtitle_perlu_render"] is False and klip["subtitle"]["gaya"] == "kuning"
+    with engine.begin() as k:                                   # simpan gaya lain: catatan "terender" tidak ikut berubah
+        k_baru = proyek.simpan_subtitle(k, pid, cid, {"gaya": "kotak"})
+    assert k_baru["subtitle_perlu_render"] is True
+    with engine.begin() as k:                                   # kembali ke gaya yang sudah ada di video
+        assert proyek.simpan_subtitle(k, pid, cid, {"gaya": "kuning", "animasi": "muncul"})["subtitle_perlu_render"] is False
+
+
+def test_render_ulang_dengan_potong_jeda_mengirim_selang_dan_mencatat_terender(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    _tulis_kata(folder_hasil, [{"w": "a", "s": 12.0, "e": 12.4}, {"w": "b", "s": 15.0, "e": 15.4}])
+    _jadwalkan(engine, pid, cid, mulai=12.0, akhir=16.0)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert "--buang" not in pj.argv                                      # jeda mati secara bawaan
+    with engine.begin() as k:
+        proyek.simpan_jeda(k, pid, cid, {"aktif": True, "ambang": 1.0})
+        assert proyek.cari_klip(k, pid, cid)["subtitle_perlu_render"] is True
+    _jadwalkan(engine, pid, cid, mulai=12.0, akhir=16.0)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    buang = json.loads(pj.argv[pj.argv.index("--buang") + 1])
+    assert buang == [[12.5, 14.9]] or buang == [[12.5, 14.9], [15.5, 16.0]]
+    with engine.connect() as k:
+        assert proyek.cari_klip(k, pid, cid)["subtitle_perlu_render"] is False      # sudah dirender dengan jeda dipotong
+        assert proyek.cari_klip(k, pid, cid)["jeda"] == {"aktif": True, "ambang": 1.0}
+
+
+def test_render_ulang_jeda_aktif_tanpa_kata_json_tetap_jalan_tanpa_potong(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    with engine.begin() as k:
+        proyek.simpan_jeda(k, pid, cid, {"aktif": True})
+    _jadwalkan(engine, pid, cid)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert "--buang" not in pj.argv
+
+
+def test_render_ulang_potongan_manual_digabung_dengan_jeda_dan_dipotong_ke_batas_klip(engine, cfg):
+    pid, cid, folder_hasil = _proyek_selesai_dengan_klip(engine, cfg)
+    with engine.begin() as k:
+        proyek.simpan_potong(k, pid, cid, [[13.0, 14.0], [15.5, 17.0], [60.0, 70.0]])
+    _jadwalkan(engine, pid, cid, mulai=12.0, akhir=16.0)
+    pj = PenjalanKlip()
+    assert _kerjakan(engine, cfg, pj)
+    assert json.loads(pj.argv[pj.argv.index("--buang") + 1]) == [[13.0, 14.0], [15.5, 16.0]]
+    with engine.connect() as k:
+        assert proyek.cari_klip(k, pid, cid)["subtitle_perlu_render"] is False

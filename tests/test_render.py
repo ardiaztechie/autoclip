@@ -3,8 +3,10 @@
 Jalankan: python -m pytest tests/test_render.py -v
 """
 import json
+import re
 import shutil
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -173,7 +175,19 @@ def test_terminal_merender_semua_klip(tmp_path, capsys):
     kode = R.main([str(v), str(daftar), "--tengah", "--folder", str(tmp_path / "h"), "--lebar", "180"])
     assert kode == 0
     assert (tmp_path / "h" / "klip_01_9x16.mp4").is_file() and (tmp_path / "h" / "klip_02_9x16.mp4").is_file()
-    assert "[2/2]" in capsys.readouterr().out
+    keluar = capsys.readouterr().out
+    assert "[2/2]" in keluar
+    persen = [int(m) for m in re.findall(r"^\[PROGRES\] (\d+) ", keluar, re.M)]
+    assert persen and persen[0] == 0 and persen == sorted(persen) and persen[-1] < 100     # naik terus, 100 tidak dicetak
+    assert "[PROGRES]" in keluar and "Merender video" in keluar
+
+
+@butuh_ffmpeg
+def test_render_klip_melapor_kemajuan_antara_0_dan_1(tmp_path):
+    v = buat_video(tmp_path / "v.mp4", detik=4)
+    bagian = []
+    R.render_klip(v, 0, 3, tmp_path / "k.mp4", lebar_keluaran=180, pada_kemajuan=bagian.append)
+    assert bagian and all(0 <= b <= 1 for b in bagian) and bagian == sorted(bagian)
 
 
 def test_terminal_klip_json_rusak(tmp_path, capsys):
@@ -198,3 +212,157 @@ def test_tampilan_lebar_dipakai_pada_selang_waktu(tmp_path):
     assert abs(atas - tengah) < 6
     atas, tengah = baris(45)                       # detik ~1,5: tampilan lebar, latar atas digelapkan
     assert atas < tengah * 0.8
+
+
+# ---------------------------------------------------------------- pusat zoom campuran
+def _jalur_campuran(mata=120.0, tinggi=360):
+    return Jalur([(0.0, 200.0, 0.0), (10.0, 200.0, 0.0)], 202, tinggi, 640, tinggi, "9:16", 1.0, (), ((2.0, 6.0),),
+                 1.25, ((0.0, 400.0, 180.0), (10.0, 400.0, 180.0)), "campuran",
+                 titik_mata=((0.0, mata), (10.0, mata)))
+
+
+def test_pusat_zoom_mata_di_sepertiga_atas():
+    j = _jalur_campuran(mata=140.0)
+    hz = 288.0
+    cx, cy = R.pusat_jendela_zoom(j, 4.0, hz, 1.0, 1.0)
+    assert cx == pytest.approx(400.0)                                    # ikut wajah
+    atas = cy - hz / 2
+    assert 140.0 - atas == pytest.approx(hz / 3)                         # mata tepat di 1/3 tinggi jendela
+
+
+def test_pusat_zoom_bobot_nol_sama_dengan_jendela_biasa():
+    j = _jalur_campuran()
+    cx, cy = R.pusat_jendela_zoom(j, 4.0, 288.0, 0.0, 0.0)
+    assert (cx, cy) == (pytest.approx(301.0), pytest.approx(180.0))
+
+
+def test_pusat_zoom_napas_x_tidak_ikut_wajah():
+    j = _jalur_campuran()
+    cx, _ = R.pusat_jendela_zoom(j, 4.0, 333.0, 0.0, 1.0, ikut_wajah_x=False)
+    assert cx == pytest.approx(301.0)
+
+
+def test_potong_zoom_campuran_ukuran_dan_posisi():
+    frame = np.zeros((360, 640, 3), np.uint8)
+    frame[:, :, :] = 0
+    frame[:, 350:450] = 255                                              # kolom terang di sekitar wajah (x 400)
+    keluar = R.potong_zoom(frame, _jalur_campuran(), 4.0, 108, 192)
+    assert keluar.shape == (192, 108, 3)
+    assert keluar[:, 40:70].mean() > 200                                 # wajah ada di tengah jendela zoom
+    j = _jalur_campuran()
+    assert R._ada_zoom(j, 4.0) and not R._ada_zoom(j, 8.0) and not R._ada_zoom(j, 2.0)   # ramp mulai dari 1,0
+
+
+def test_potong_zoom_dengan_zoom_dasar_memperbesar_wajah():
+    import numpy as np
+    from core import render as R
+    from core.face import Jalur
+    frame = np.zeros((360, 640, 3), np.uint8)
+    frame[130:230, 270:370] = 255                                  # "wajah" 100x100 di tengah
+    dasar = ((0.0, 1.8), (5.0, 1.8))
+    j = Jalur([(0.0, 219.0, 0.0), (5.0, 219.0, 0.0)], 202, 360, 640, 360, "9:16", 1.0, gaya="campuran",
+              titik_zoom=((0.0, 320.0, 180.0), (5.0, 320.0, 180.0)), titik_dasar=dasar)
+    polos = Jalur([(0.0, 219.0, 0.0), (5.0, 219.0, 0.0)], 202, 360, 640, 360, "9:16", 1.0, gaya="campuran")
+    a = R.potong_zoom(frame, j, 1.0, 270, 480)
+    b = R.potong_zoom(frame, polos, 1.0, 270, 480) if R._ada_zoom(polos, 1.0) else None
+    assert R._ada_zoom(j, 1.0) and b is None
+    assert a.shape == (480, 270, 3) and (a > 200).mean() > 0.3          # kotak putih mengisi sebagian besar bingkai
+
+
+@butuh_ffmpeg
+def test_potongan_ukuran_gambar_berganti_langsung_bukan_bertahap(tmp_path):
+    """Wajah tiruan (lingkaran) di video 640x360; jalur dari susun_jalur(potongan=True): ukuran wajah di layar harus
+    melompat dalam satu frame saat potongan, dan tidak berubah bertahap di antaranya."""
+    import cv2
+    from core import pembicara as P
+    from core.face import Kotak
+    L, T, FPS = 640, 360, 25
+    v = tmp_path / "w.mp4"
+    w = cv2.VideoWriter(str(v), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (L, T))
+    for _ in range(9 * FPS):
+        f = np.zeros((T, L, 3), np.uint8)
+        f[:] = (60, 70, 50)
+        cv2.circle(f, (320, 150), 40, (170, 190, 225), -1)
+        w.write(f)
+    w.release()
+    sampel = [P.Sampel(round(i * 0.1, 3), (P.Pengamatan(1, Kotak(280, 110, 80, 80, 0.9, 140), 3.0, 1.0),), False, 0.0)
+              for i in range(90)]
+    jalur, _ = P.susun_jalur(sampel, [1] * 90, set(), L, T, "9:16", gaya="campuran", potongan=True)
+    assert jalur.titik_dasar
+    k = tmp_path / "k.mp4"
+    R.render_klip(v, 0, 8.5, k, rasio="9:16", jalur=jalur, lebar_keluaran=180)
+    cap = cv2.VideoCapture(str(k))
+    lebar_wajah = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        m = (abs(f[..., 0].astype(int) - 170) < 30) & (abs(f[..., 1].astype(int) - 190) < 30) & (abs(f[..., 2].astype(int) - 225) < 30)
+        xs = np.where(m.any(0))[0]
+        lebar_wajah.append(int(xs.max() - xs.min()) if len(xs) else 0)
+    selisih = [abs(b - a) for a, b in zip(lebar_wajah, lebar_wajah[1:])]
+    lompatan = [x for x in selisih if x > 8]
+    assert len(lompatan) >= 1                                              # ada potongan yang terlihat
+    assert all(x <= 3 or x > 8 for x in selisih)                           # tidak ada perubahan ukuran yang bertahap
+
+
+@butuh_ffmpeg
+def test_buang_jeda_memperpendek_gambar_dan_suara_dengan_sinkron(tmp_path):
+    v = buat_video(tmp_path / "v.mp4")
+    out = tmp_path / "k.mp4"
+    r = R.render_klip(v, 0.0, 4.0, out, rasio="9:16", lebar_keluaran=360, buang=[(1.0, 2.0)])
+    assert abs(r["durasi"] - 3.0) < 0.1 and r["frame"] == 90
+    import av
+    with av.open(str(out)) as c:
+        durasi_suara = sum(float(p.duration * p.time_base) for p in c.demux(c.streams.audio[0]) if p.duration)
+    assert abs(durasi_suara - 3.0) < 0.15
+    assert abs(kecerahan_frame(out, 29) - kecerahan_frame(v, 29)) < 6      # sebelum lubang: frame sumber 29
+    assert abs(kecerahan_frame(out, 30) - kecerahan_frame(v, 60)) < 6      # setelah lubang: loncat ke frame sumber 60 (t = 2,0 dtk)
+
+
+@butuh_ffmpeg
+def test_buang_jeda_semua_klip_ditolak(tmp_path):
+    v = buat_video(tmp_path / "v.mp4")
+    with pytest.raises(ValueError, match="terbuang"):
+        R.render_klip(v, 1.0, 3.0, tmp_path / "k.mp4", lebar_keluaran=360, buang=[(0.0, 4.0)])
+
+
+@butuh_ffmpeg
+def test_buang_jeda_subtitle_ikut_bergeser(tmp_path, monkeypatch):
+    v = buat_video(tmp_path / "v.mp4")
+    ditangkap = {}
+    asli = R.buat_ass
+    monkeypatch.setattr(R, "buat_ass", lambda kata, mulai, akhir, *a, **k: ditangkap.update(kata=kata, akhir=akhir) or asli(kata, mulai, akhir, *a, **k))
+    kata = [{"w": "satu", "s": 0.2, "e": 0.8}, {"w": "dua", "s": 2.5, "e": 3.0}]
+    R.render_klip(v, 0.0, 4.0, tmp_path / "k.mp4", lebar_keluaran=360, kata=kata, buang=[(1.0, 2.0)])
+    assert [round(k["s"], 2) for k in ditangkap["kata"]] == [0.2, 1.5] and abs(ditangkap["akhir"] - 3.0) < 0.05
+
+
+@butuh_ffmpeg
+@pytest.mark.parametrize("dengan_suara", [True, False])
+def test_terminal_buang_jeda_dengan_subtitle_dan_tanpa_suara(tmp_path, dengan_suara):
+    """Jalur yang dipakai worker: python -m core.render ... --kata kata.json --buang [[a,b]] (kata dibaca sebagai objek Word)."""
+    v = buat_video(tmp_path / "v.mp4", detik=10, dengan_suara=dengan_suara)
+    (tmp_path / "k.json").write_text(json.dumps([{"mulai": 3.3, "akhir": 9.2}]))
+    (tmp_path / "kata.json").write_text(json.dumps([{"w": "x", "s": 3.4, "e": 3.8}, {"w": "y", "s": 6.0, "e": 6.5}]))
+    r = subprocess.run([sys.executable, "-m", "core.render", str(v), str(tmp_path / "k.json"), "--folder", str(tmp_path / "o"),
+                        "--kata", str(tmp_path / "kata.json"), "--mode", "tengah", "--buang", "[[4.1, 5.7]]", "--lebar", "360"],
+                       capture_output=True, text=True, cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    hasil = next((tmp_path / "o").glob("klip_*.mp4"))
+    assert abs(info(hasil)["durasi"] - (5.9 - 1.6)) < 0.3
+
+
+def test_terminal_potongan_kamera_mati_bawaan_dan_hidup_bila_diminta(monkeypatch, tmp_path):
+    """Bawaan: kamera mengikuti wajah dengan gerak halus (tanpa potongan langsung). Potongan hanya bila --potongan-kamera."""
+    from core import pembicara as PB
+    diterima = []
+    def palsu(*a, **k):
+        diterima.append(k.get("potongan"))
+        raise ValueError("berhenti di sini")
+    monkeypatch.setattr(PB, "lacak_pembicara", palsu)
+    (tmp_path / "v.mp4").write_bytes(b"x")
+    (tmp_path / "k.json").write_text(json.dumps([{"mulai": 0.0, "akhir": 5.0}]))
+    for tambahan in ([], ["--potongan-kamera"]):
+        assert R.main([str(tmp_path / "v.mp4"), str(tmp_path / "k.json"), "--folder", str(tmp_path / "o"), "--tanpa-zoom", *tambahan]) == 1
+    assert diterima == [False, True]

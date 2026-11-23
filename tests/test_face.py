@@ -8,7 +8,7 @@ import os
 import pytest
 
 from core import face as F
-from core.face import Kotak
+from core.face import Jalur, Kotak
 
 
 def wajah(cx, cy, ukuran=100, skor=0.9):
@@ -149,3 +149,47 @@ def test_deteksi_nyata():
     assert deteksi and w > 0 and h > 0 and fps > 0
     j = F.bangun_jalur(deteksi, w, h, "9:16")
     assert all(0 <= p[1] <= w - j.lebar_potong for p in j.titik)
+
+
+# ---------------------------------------------------------------- zoom campuran
+def _jalur_zoom(gaya, **kw):
+    return Jalur([(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)], 202, 360, 640, 360, "9:16", 1.0, (), ((2.0, 6.0),), 1.25,
+                 ((0.0, 100.0, 180.0), (10.0, 100.0, 180.0)), gaya, **kw)
+
+
+def test_faktor_gaya_lama_langsung_atau_tidak():
+    j = _jalur_zoom("lama")
+    assert j.faktor_pada(1.99) == 1.0 and j.faktor_pada(2.0) == 1.25 and j.faktor_pada(6.0) == 1.25
+    assert j.faktor_pada(6.01) == 1.0
+
+
+def test_faktor_campuran_masuk_cepat_keluar_halus():
+    j = _jalur_zoom("campuran")
+    assert j.faktor_pada(2.0) == pytest.approx(1.0)
+    assert j.faktor_pada(2.0 + 0.12) == pytest.approx(1.25)               # sudah penuh setelah 0,12 dtk
+    assert 1.0 < j.faktor_pada(2.06) < 1.25
+    assert j.faktor_pada(4.0) == pytest.approx(1.25)
+    assert j.faktor_pada(6.0) == pytest.approx(1.0)                       # keluar mulus sampai 1,0
+    assert 1.0 < j.faktor_pada(5.8) < 1.25
+    assert j.faktor_pada(5.8) > j.faktor_pada(5.9)                        # menurun satu arah
+    assert j.faktor_pada(1.0) == 1.0 and j.faktor_pada(8.0) == 1.0
+
+
+def test_faktor_napas_mendekat_dan_menjauh():
+    masuk = Jalur([(0.0, 0, 0)], 202, 360, 640, 360, "9:16", 1.0, gaya="campuran", selang_napas=((0.0, 4.0, 1),))
+    assert masuk.faktor_pada(0.0) == pytest.approx(1.0) and masuk.faktor_pada(4.0) == pytest.approx(1.08)
+    assert masuk.faktor_pada(1.0) < masuk.faktor_pada(2.0) < masuk.faktor_pada(3.0)
+    keluar = Jalur([(0.0, 0, 0)], 202, 360, 640, 360, "9:16", 1.0, gaya="campuran", selang_napas=((0.0, 4.0, -1),))
+    assert keluar.faktor_pada(0.0) == pytest.approx(1.08) and keluar.faktor_pada(4.0) == pytest.approx(1.0)
+
+
+def test_mata_pada_interpolasi_dan_kosong():
+    j = Jalur([(0.0, 0, 0)], 202, 360, 640, 360, "9:16", 1.0, titik_mata=((1.0, 100.0), (3.0, 140.0)))
+    assert j.mata_pada(0.0) == 100.0 and j.mata_pada(2.0) == pytest.approx(120.0) and j.mata_pada(9.0) == 140.0
+    assert Jalur([(0.0, 0, 0)], 202, 360, 640, 360, "9:16", 1.0).mata_pada(1.0) is None
+
+
+def test_ease_mulus_dan_terbatas():
+    from core.face import _halus_ease
+    assert _halus_ease(-1) == 0.0 and _halus_ease(2) == 1.0 and _halus_ease(0.5) == pytest.approx(0.5)
+    assert _halus_ease(0.1) < 0.1 < _halus_ease(0.9) < 1.0

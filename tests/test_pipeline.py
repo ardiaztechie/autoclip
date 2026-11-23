@@ -115,3 +115,14 @@ def test_preset_durasi():
     assert PRESET_DURASI["sedang"] == (30.0, 60.0)
     assert PRESET_DURASI["otomatis"] == (30.0, 60.0)
     assert all(a < b for a, b in PRESET_DURASI.values())
+
+
+@pytest.mark.parametrize("nama,mn,mk", [("sangat_panjang", 90.0, 120.0), ("ekstra_panjang", 120.0, 180.0)])
+def test_durasi_bertahap_sampai_3_menit(tmp_path, nama, mn, mk):
+    assert P.PRESET_DURASI[nama] == (mn, mk)
+    masuk = tmp_path / "kata.json"
+    masuk.write_text(ke_json(kata_sintetis(2000)), encoding="utf-8")        # sekitar 13 menit
+    keluar = tmp_path / "klip.json"
+    assert P.main([str(masuk), "--n", "3", "--durasi", nama, "--simpan", str(keluar)]) == 0
+    data = json.loads(keluar.read_text(encoding="utf-8"))
+    assert data and all(mn - 1e-6 <= k["durasi"] <= mk + 1e-6 for k in data)

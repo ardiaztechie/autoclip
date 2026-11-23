@@ -340,3 +340,216 @@ def test_terminal_gagal_kode_1(tmp_path, capsys):
 def test_analisis_nyata():
     jalur, lap = P.lacak_pembicara(os.environ["AUTOCLIP_VIDEO_UJI"], 0, 6, "9:16")
     assert jalur.titik and len(lap.pembicara_x) == len(lap.terbesar_x) > 0
+
+
+# ---------------------------------------------------------------- gaya kamera campuran
+def peng_mata(id_, cx, mata_y, ukuran=100):
+    k = Kotak(cx - ukuran / 2, 180 - ukuran / 2, ukuran, ukuran, 0.9, mata_y)
+    return P.Pengamatan(id_, k, 0.0, 5.0)
+
+
+def test_gaya_lama_tidak_berubah_dan_tanpa_napas():
+    sampel = rangkai(120, lambda i: [peng(1, 320)])
+    jalur, _ = P.susun_jalur(sampel, [1] * 120, set(), L, T, "9:16")
+    assert jalur.gaya == "lama" and jalur.selang_napas == () and jalur.titik_mata == ()
+
+
+def test_campuran_memberi_napas_pada_bagian_tenang_bergantian_arah():
+    sampel = rangkai(200, lambda i: [peng_mata(1, 320, 160)])          # 20 detik tenang, satu pembicara
+    jalur, _ = P.susun_jalur(sampel, [1] * 200, set(), L, T, "9:16", gaya="campuran")
+    assert jalur.gaya == "campuran" and len(jalur.selang_napas) == 1
+    a, b, arah = jalur.selang_napas[0]
+    assert a == pytest.approx(0.0) and b == pytest.approx(19.9) and arah == 1
+    assert jalur.titik_mata and jalur.mata_pada(5.0) == pytest.approx(160)
+
+
+def test_campuran_tanpa_napas_bila_dimatikan():
+    sampel = rangkai(200, lambda i: [peng_mata(1, 320, 160)])
+    jalur, _ = P.susun_jalur(sampel, [1] * 200, set(), L, T, "9:16", gaya="campuran", napas=False)
+    assert jalur.selang_napas == ()
+
+
+def test_napas_dipecah_di_pergantian_pembicara_dan_arah_bergantian():
+    sampel = dua_orang(120, lambda i: 1 if i < 60 else 2)             # 12 detik, ganti pembicara di detik 6
+    pembicara = P.pilih_pembicara(sampel, set())
+    jalur, _ = P.susun_jalur(sampel, pembicara, set(), L, T, "9:16", gaya="campuran")
+    assert [x[2] for x in jalur.selang_napas] == [1, -1]
+    assert all(not (a < 6.0 < b) for a, b, _ in jalur.selang_napas)
+
+
+def test_susun_napas_buang_bagian_pendek_tanpa_wajah_dan_tumpang_tindih():
+    waktu = [i * 0.1 for i in range(200)]
+    ada = [True] * 200
+    assert P.susun_napas(0.0, 19.9, (), [], waktu, ada) == ((0.0, 19.9, 1),)
+    assert P.susun_napas(0.0, 2.9, (), [], waktu[:30], ada[:30]) == ()                       # < NAPAS_MIN
+    assert P.susun_napas(0.0, 19.9, (), [], waktu, [False] * 200) == ()                      # tanpa wajah
+    hasil = P.susun_napas(0.0, 19.9, ((8.0, 10.0),), [], waktu, ada)                          # dilewati zoom/lebar
+    assert [(a, b) for a, b, _ in hasil] == [(0.0, 8.0), (10.0, 19.9)]
+    hasil = P.susun_napas(0.0, 19.9, (), [10.0], waktu, ada)                                  # dipecah di potongan
+    assert len(hasil) == 2
+
+
+def test_campuran_zona_nyaman_lebih_sempit_membuat_jendela_ikut_gerak_kecil():
+    sampel = rangkai(100, lambda i: [peng(1, 320 + 40 * np.sin(i / 3.0), 0.0, 4.0)])
+    lama, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16")
+    baru, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16", zona_mati=P.ZONA_CAMPURAN)
+    rentang = lambda j: max(p[1] for p in j.titik) - min(p[1] for p in j.titik)
+    assert rentang(lama) == 0.0 and rentang(baru) > 0.0
+
+
+# ---------------------------------------------------------------- tanpa wajah => tampilan lebar; wajah kecil => zoom dasar
+def test_selang_tanpa_wajah_hanya_untuk_yang_cukup_lama():
+    waktu = [round(i * 0.1, 3) for i in range(100)]
+    ada = [not (30 <= i < 60 or 80 <= i < 83) for i in range(100)]               # 3 dtk kosong dan 0,3 dtk kosong
+    assert P.selang_tanpa_wajah(waktu, ada) == [(3.0, 6.0)]
+    assert P.selang_tanpa_wajah(waktu, [False] * 100) == [(0.0, 10.0)]            # kosong sampai akhir
+    assert P.selang_tanpa_wajah([], []) == []
+
+
+def test_campuran_tanpa_wajah_menjadi_tampilan_lebar_dan_lama_tidak_berubah():
+    sampel = rangkai(100, lambda i: [peng_mata(1, 320, 160)] if i < 30 or i >= 70 else [])   # kosong detik 3,0-7,0
+    campur, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16", gaya="campuran")
+    assert any(a == pytest.approx(3.0) and b == pytest.approx(7.0) for a, b in campur.selang_lebar)
+    assert all(not (a < 5.0 < b) for a, b, _ in campur.selang_napas)               # tidak ada zoom napas di bagian kosong
+    lama, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16")
+    assert lama.selang_lebar == ()
+
+
+def test_campuran_wajah_hilang_sebentar_tidak_memicu_tampilan_lebar():
+    sampel = rangkai(100, lambda i: [] if 40 <= i < 43 else [peng_mata(1, 320, 160)])
+    jalur, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16", gaya="campuran")
+    assert jalur.selang_lebar == ()
+
+
+def test_campuran_wajah_kecil_diberi_zoom_dasar_dan_wajah_besar_tidak():
+    kecil = rangkai(50, lambda i: [peng_mata(1, 320, 160, ukuran=40)])
+    j, _ = P.susun_jalur(kecil, [1] * 50, set(), L, T, "9:16", gaya="campuran", zoom_dasar=True)
+    assert j.faktor_dasar(2.0) == pytest.approx(1.77, abs=0.05) and j.faktor_pada(2.0) >= 1.7
+    besar = rangkai(50, lambda i: [peng_mata(1, 320, 160, ukuran=100)])
+    j2, _ = P.susun_jalur(besar, [1] * 50, set(), L, T, "9:16", gaya="campuran", zoom_dasar=True)
+    assert j2.titik_dasar == () and j2.faktor_dasar(2.0) == 1.0
+    lama, _ = P.susun_jalur(kecil, [1] * 50, set(), L, T, "9:16")
+    mati, _ = P.susun_jalur(kecil, [1] * 50, set(), L, T, "9:16", gaya="campuran")      # bawaan: mati
+    assert mati.titik_dasar == ()
+    assert lama.titik_dasar == () and lama.faktor_pada(2.0) == 1.0
+
+
+def test_zoom_dasar_dibatasi_dan_berpindah_mulus_antar_orang():
+    sangat_kecil = rangkai(30, lambda i: [peng_mata(1, 320, 160, ukuran=10)])
+    j, _ = P.susun_jalur(sangat_kecil, [1] * 30, set(), L, T, "9:16", gaya="campuran", zoom_dasar=True)
+    assert j.faktor_dasar(1.0) == pytest.approx(P.MAKS_ZOOM_DASAR)
+    sampel = rangkai(60, lambda i: [peng_mata(1, 320, 160, ukuran=100 if i < 30 else 40)])
+    j2, _ = P.susun_jalur(sampel, [1] * 60, set(), L, T, "9:16", gaya="campuran", zoom_dasar=True)
+    nilai = [f for _, f in j2.titik_dasar]
+    assert max(abs(b - a) for a, b in zip(nilai, nilai[1:])) < 0.2                   # tidak loncat
+
+
+# ---------------------------------------------------------------- reaksi lawan bicara; gerak halus gaya campuran
+def dua_gerak(n, gerak_b):
+    """Orang 1 (kiri) bicara terus; orang 2 (kanan) diam kecuali gerak_b(i) besar."""
+    return rangkai(n, lambda i: [peng(1, 160, mulut=5.0, wajah=0.4), peng(2, 480, mulut=0.0, wajah=gerak_b(i))])
+
+
+def test_reaksi_lawan_bicara_menjadi_cut_singkat_lalu_kembali():
+    sampel = dua_gerak(120, lambda i: 8.0 if 50 <= i < 58 else 0.4)                 # gerak besar 0,8 dtk di detik 5,0
+    asli = [1] * 120
+    hasil = P.tambah_reaksi(sampel, asli, set())
+    cut = [i for i, x in enumerate(hasil) if x == 2]
+    assert cut and cut[0] == 50 and 10 <= len(cut) <= 20                            # 1-2 dtk
+    assert hasil[:50] == [1] * 50 and hasil[cut[-1] + 1:] == [1] * (119 - cut[-1])
+
+
+def test_reaksi_tidak_dihitung_untuk_gerak_singkat_foto_atau_pembicara_sendiri():
+    singkat = dua_gerak(120, lambda i: 8.0 if 50 <= i < 53 else 0.4)                # 0,3 dtk
+    assert P.tambah_reaksi(singkat, [1] * 120, set()) == [1] * 120
+    besar = dua_gerak(120, lambda i: 8.0 if 50 <= i < 60 else 0.4)
+    assert P.tambah_reaksi(besar, [1] * 120, {2}) == [1] * 120                      # orang 2 adalah foto
+    assert P.tambah_reaksi(besar, [2] * 120, set()) == [2] * 120                    # orang 2 sudah pembicara
+
+
+def test_reaksi_diberi_jarak_dan_tidak_melewati_pergantian_kamera():
+    sampel = dua_gerak(200, lambda i: 8.0 if (50 <= i < 60 or 70 <= i < 80) else 0.4)   # dua reaksi berdekatan
+    hasil = P.tambah_reaksi(sampel, [1] * 200, set())
+    awal = [i for i in range(1, 200) if hasil[i] == 2 and hasil[i - 1] != 2]
+    assert awal == [50]                                                              # yang kedua dibuang (jarak < 8 dtk)
+    potong = dua_gerak(120, lambda i: 8.0 if 50 <= i < 60 else 0.4)
+    potong = [P.Sampel(s.t, s.wajah, s.potong or i == 55, s.luas_gerak) for i, s in enumerate(potong)]
+    hasil = P.tambah_reaksi(potong, [1] * 120, set())
+    assert all(hasil[i] == 1 for i in range(55, 120))
+
+
+def test_campuran_ikut_gerak_wajah_kecil_tapi_halus():
+    sampel = rangkai(100, lambda i: [peng(1, 320 + 15 * np.sin(i / 6.0), 0.0, 4.0)])
+    baru, _ = P.susun_jalur(sampel, [1] * 100, set(), L, T, "9:16", zona_mati=0.03, alpha=0.15)          # opsional: lebih peka, bukan bawaan
+    x = [p[1] for p in baru.titik]
+    assert max(x) - min(x) > 3.0                                                    # ikut gerak kecil
+    assert max(abs(b - a) for a, b in zip(x, x[1:])) < 4.0                          # tanpa loncatan
+
+
+# ---------------------------------------------------------------- potongan ukuran gambar (cut-to-cut)
+def _jeda_kata(n=60, selang=0.3):
+    return [Word("k", round(selang * i, 3), round(selang * i + 0.2, 3)) for i in range(n)]    # jeda 0,1 dtk antar kata
+
+
+def test_titik_jeda_tengah_jeda_antar_kata():
+    kata = [Word("a", 0.0, 0.4), Word("b", 0.5, 0.9), Word("c", 0.92, 1.3), Word("d", 2.0, 2.4)]
+    assert P.titik_jeda(kata, 0.0, 3.0) == [0.45, 1.65]                    # jeda 0,02 (b-c) terlalu pendek
+    assert P.titik_jeda(kata, 0.6, 1.5) == []                              # hanya jeda 0,02 di rentang ini
+    assert P.titik_jeda(None, 0, 5) == []
+
+
+def _jadwal(n=200, **kw):
+    waktu = [round(i * 0.1, 3) for i in range(n)]
+    lebar = [100.0] * n
+    return waktu, P.susun_potongan(waktu, lebar, kw.pop("ganti", []), kw.pop("jeda", []), 360.0, **kw)
+
+
+def test_potongan_tiap_3_sampai_5_detik_dan_ukuran_beda():
+    waktu, jadwal = _jadwal(300, jeda=P.titik_jeda(_jeda_kata(), 0, 30))
+    t = [a for a, _ in jadwal]
+    jarak = [b - a for a, b in zip(t, t[1:])]
+    assert len(jadwal) >= 5 and t[0] == 0.0
+    assert all(1.9 <= j <= 6.1 for j in jarak), jarak                      # 3-5 dtk, digeser sampai +-1 dtk ke jeda kata
+    faktor = [f for _, f in jadwal]
+    assert all(abs(a - b) >= P.POTONGAN_BEDA_MIN - 1e-9 for a, b in zip(faktor, faktor[1:]))
+    assert max(faktor) > 1.0 and min(faktor) >= 1.0 and max(faktor) <= P.MAKS_ZOOM_DASAR
+
+
+def test_potongan_jatuh_di_jeda_antar_kata_bukan_tengah_kata():
+    kata = _jeda_kata(120)
+    jeda = P.titik_jeda(kata, 0, 35)
+    _, jadwal = _jadwal(350, jeda=jeda)
+    for t, _ in jadwal[1:]:
+        assert any(abs(t - j) < 0.002 for j in jeda), t
+
+
+def test_potongan_deterministik_dan_ikut_pergantian_pembicara():
+    a = _jadwal(200, ganti=[8.0], awal_acak=7)[1]
+    assert a == _jadwal(200, ganti=[8.0], awal_acak=7)[1]
+    assert a != _jadwal(200, ganti=[8.0], awal_acak=8)[1]
+    assert any(abs(t - 8.0) < 0.002 for t, _ in a)                          # pergantian pembicara selalu potongan
+
+
+def test_potongan_dibatasi_ukuran_wajah_dan_tanpa_sampel():
+    waktu = [round(i * 0.1, 3) for i in range(100)]
+    besar = P.susun_potongan(waktu, [200.0] * 100, [], [], 360.0)          # wajah 200 dari jendela 360: ruang zoom sedikit
+    assert all(f <= 0.62 * 360 / 200 + 1e-9 or f == 1.0 for _, f in besar)
+    assert P.susun_potongan([], [], [], [], 360.0) == []
+
+
+def test_titik_dari_potongan_bertangga_potongan_langsung():
+    assert P.titik_dari_potongan([(0.0, 1.0), (4.0, 1.45), (8.0, 1.2)]) == \
+        ((0.0, 1.0), (3.999, 1.0), (4.0, 1.45), (7.999, 1.45), (8.0, 1.2))
+
+
+def test_susun_jalur_potongan_menyalakan_zoom_dasar_bertangga_dan_mematikan_zoom_tambahan():
+    sampel = rangkai(120, lambda i: [peng(1, 320, mulut=3.0, ukuran=80)])
+    biasa, _ = P.susun_jalur(sampel, [1] * 120, set(), L, T, "9:16", gaya="campuran", selang_zoom=[(2.0, 3.0)], faktor_zoom=1.25)
+    assert biasa.titik_dasar == () and biasa.selang_zoom
+    jalur, _ = P.susun_jalur(sampel, [1] * 120, set(), L, T, "9:16", gaya="campuran", selang_zoom=[(2.0, 3.0)],
+                             faktor_zoom=1.25, potongan=True, waktu_jeda=P.titik_jeda(_jeda_kata(), 0, 12))
+    assert jalur.titik_dasar and jalur.selang_zoom == () and jalur.selang_napas == ()
+    assert len({f for _, f in jalur.titik_dasar}) >= 2
+    assert jalur.faktor_dasar(0.5) == jalur.titik_dasar[0][1]
+    lama, _ = P.susun_jalur(sampel, [1] * 120, set(), L, T, "9:16", gaya="lama", potongan=True)         # hanya gaya campuran
+    assert lama.titik_dasar == ()

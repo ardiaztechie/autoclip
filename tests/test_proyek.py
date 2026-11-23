@@ -378,7 +378,7 @@ def test_kolom_baru_ada_di_schema_sql_dan_n_clips_boleh_kosong():
     kolom, blok = _kolom(sql, "projects")
     assert {"n_clips", "clip_density", "clip_length"} <= kolom
     assert re.search(r"n_clips\s+TINYINT UNSIGNED NULL", blok) and "NOT NULL DEFAULT 'sedang'" in blok
-    for nilai in ("'jarang'", "'sedang'", "'rapat'", "'otomatis'", "'pendek'", "'panjang'"):
+    for nilai in ("'jarang'", "'sedang'", "'rapat'", "'otomatis'", "'pendek'", "'panjang'", "'sangat_panjang'", "'ekstra_panjang'"):
         assert nilai in blok
 
 
@@ -388,3 +388,34 @@ def test_buat_menolak_pilihan_aneh(engine):
             proyek.buat(k, 1, "t", "s", "auto", "9:16", None, True, kepadatan="padat")
         with pytest.raises(ValueError):
             proyek.buat(k, 1, "t", "s", "auto", "9:16", None, True, panjang="super")
+
+
+# ---------------------------------------------------------------- batal proses proyek
+def test_batal_proyek_antre_menandai_dibatalkan_dan_membatalkan_pekerjaan(ani, engine):
+    klien, _ = ani
+    pid = _unggah(klien).json()["id"]
+    r = klien.post(f"/projects/{pid}/batal")
+    assert r.status_code == 200 and (r.json()["status"], r.json()["stage"]) == ("failed", "Dibatalkan")
+    with engine.connect() as k:
+        assert tuple(k.execute(text("SELECT status, error FROM job_queue")).one()) == ("failed", "dibatalkan")
+    assert klien.get(f"/projects/{pid}").json()["stage"] == "Dibatalkan"
+    assert klien.post(f"/projects/{pid}/batal").status_code == 409                 # sudah tidak berjalan
+
+
+def test_batal_proyek_selesai_ditolak(ani, engine):
+    klien, _ = ani
+    pid = _unggah(klien).json()["id"]
+    with engine.begin() as k:
+        k.execute(text("UPDATE projects SET status = 'done' WHERE id = :i"), {"i": pid})
+    assert klien.post(f"/projects/{pid}/batal").status_code == 409
+    assert klien.get(f"/projects/{pid}").json()["status"] == "done"
+
+
+def test_batal_proyek_orang_lain_dan_tanpa_login(app, ani, engine):
+    klien, _ = ani
+    pid = _unggah(klien).json()["id"]
+    budi, _ = _klien_masuk(app, engine, "budi@contoh.com")
+    assert budi.post(f"/projects/{pid}/batal").status_code == 404
+    assert klien.post("/projects/999/batal").status_code == 404
+    assert TestClient(app).post(f"/projects/{pid}/batal").status_code == 401
+    assert klien.get(f"/projects/{pid}").json()["status"] == "queued"

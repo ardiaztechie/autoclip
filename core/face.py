@@ -43,6 +43,7 @@ class Kotak:
     w: float
     h: float
     skor: float = 1.0
+    mata_y: float = None   # tinggi garis mata (rata-rata dua titik mata dari YuNet), piksel bingkai; None = tidak diketahui
 
     @property
     def pusat(self):
@@ -51,6 +52,18 @@ class Kotak:
     @property
     def luas(self):
         return self.w * self.h
+
+
+ZOOM_MASUK = 0.12     # detik: zoom penekanan masuk (cepat, terasa seperti cut)
+ZOOM_KELUAR = 0.40    # detik: zoom penekanan keluar (halus)
+FAKTOR_NAPAS = 1.08   # zoom pelan saat tenang: 1,00 -> 1,08 (atau sebaliknya)
+NAPAS_MIN = 3.0       # detik: bagian tenang paling pendek yang diberi zoom pelan
+
+
+def _halus_ease(u: float) -> float:
+    """Lengkung mulus 0..1 (smoothstep): mulai dan berhenti pelan."""
+    u = min(max(u, 0.0), 1.0)
+    return u * u * (3.0 - 2.0 * u)
 
 
 @dataclass(frozen=True)
@@ -66,6 +79,56 @@ class Jalur:
     selang_zoom: tuple = ()   # [(awal, akhir)] detik: zoom in penekanan (potong langsung)
     faktor_zoom: float = 1.0  # jendela dipersempit menjadi 1/faktor selama selang_zoom
     titik_zoom: tuple = ()    # [(waktu, pusat_x, pusat_y)] pusat zoom (wajah pembicara); kosong = tengah jendela
+    gaya: str = "lama"        # "lama": zoom potong langsung | "campuran": zoom masuk cepat/keluar halus + zoom napas
+    selang_napas: tuple = ()  # [(awal, akhir, arah)] zoom pelan saat tenang; arah +1 mendekat, -1 menjauh
+    titik_mata: tuple = ()    # [(waktu, y_mata)] tinggi garis mata pembicara; dipakai agar mata di sepertiga atas
+    titik_dasar: tuple = ()   # [(waktu, faktor)] zoom dasar agar wajah kecil (shot lebar) mengisi bingkai; hanya gaya campuran
+
+    def faktor_dasar(self, t: float) -> float:
+        """Zoom dasar pada waktu t (>= 1,0), interpolasi linear; 1,0 bila tidak ada atau bukan gaya campuran."""
+        p = self.titik_dasar
+        if self.gaya != "campuran" or not p:
+            return 1.0
+        if t <= p[0][0]:
+            return p[0][1]
+        if t >= p[-1][0]:
+            return p[-1][1]
+        for (t0, f0), (t1, f1) in zip(p, p[1:]):
+            if t0 <= t <= t1:
+                return f0 if t1 == t0 else f0 + (t - t0) / (t1 - t0) * (f1 - f0)
+        return p[-1][1]
+
+    def faktor_pada(self, t: float) -> float:
+        """Faktor zoom total pada waktu t (1,0 = tanpa zoom): zoom dasar x zoom tambahan (penekanan/napas)."""
+        return self.faktor_dasar(t) * self.faktor_tambahan(t)
+
+    def faktor_tambahan(self, t: float) -> float:
+        """Faktor zoom penekanan atau napas saja. Gaya lama: 0/1 langsung; campuran: lengkung halus."""
+        if self.gaya != "campuran":
+            return self.faktor_zoom if any(a <= t <= b for a, b in self.selang_zoom) else 1.0
+        for a, b in self.selang_zoom:
+            if a <= t <= b:
+                naik, turun = _halus_ease((t - a) / ZOOM_MASUK), _halus_ease((b - t) / ZOOM_KELUAR)
+                return 1.0 + (self.faktor_zoom - 1.0) * min(naik, turun)
+        for a, b, arah in self.selang_napas:
+            if a <= t <= b and b > a:
+                u = _halus_ease((t - a) / (b - a))
+                return 1.0 + (FAKTOR_NAPAS - 1.0) * (u if arah > 0 else 1.0 - u)
+        return 1.0
+
+    def mata_pada(self, t: float):
+        """Tinggi mata (piksel bingkai) pada waktu t, interpolasi linear; None bila tidak diketahui."""
+        p = self.titik_mata
+        if not p:
+            return None
+        if t <= p[0][0]:
+            return p[0][1]
+        if t >= p[-1][0]:
+            return p[-1][1]
+        for (t0, y0), (t1, y1) in zip(p, p[1:]):
+            if t0 <= t <= t1:
+                return y0 if t1 == t0 else y0 + (t - t0) / (t1 - t0) * (y1 - y0)
+        return p[-1][1]
 
     def pada(self, t: float):
         """Posisi (x_kiri, y_atas) pada waktu t, interpolasi linear; di luar rentang = ujungnya."""
@@ -232,7 +295,8 @@ def deteksi_video(path_video, mulai: float, akhir: float, *, langkah: float = LA
             if wajah is not None:
                 for r in wajah:
                     kotak.append(Kotak(float(r[0]) / skala, float(r[1]) / skala,
-                                       float(r[2]) / skala, float(r[3]) / skala, float(r[14])))
+                                       float(r[2]) / skala, float(r[3]) / skala, float(r[14]),
+                                       (float(r[5]) + float(r[7])) / 2 / skala))
             hasil.append((round(t, 3), kotak))
         return hasil, lebar, tinggi, fps
     finally:

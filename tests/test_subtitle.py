@@ -134,3 +134,76 @@ def test_subtitle_terbakar_ke_video(tmp_path):
     assert frame(polos, 20).max() < 40                            # video hitam tanpa teks
     assert frame(berteks, 20).max() > 200                         # ada teks putih pada detik ~0,7
     assert frame(berteks, 20)[: 640 // 2].max() < 40              # teks di bagian bawah, atas tetap hitam
+
+
+# ---------------------------------------------------------------- gaya, posisi, ukuran
+def _gaya_baris(ass):
+    return [b for b in ass.split("\n") if b.startswith("Style:")][0].split(",")
+
+
+def test_bawaan_sama_dengan_klasik_bawah_sedang():
+    k = kata_dari("HALO DUNIA SEMUA", mulai=1.0)
+    assert S.buat_ass(k, 0.5, 4.0, 360, 640) == S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="klasik", posisi="bawah", ukuran="sedang")
+
+
+@pytest.mark.parametrize("gaya", list(S.GAYA))
+def test_semua_gaya_menghasilkan_ass_valid(gaya):
+    ass = S.buat_ass(kata_dari("HALO DUNIA SEMUA SAYA", mulai=1.0), 0.5, 5.0, 360, 640, gaya=gaya)
+    assert "[V4+ Styles]" in ass and "Dialogue:" in ass
+
+
+def test_gaya_kotak_memakai_border_style_3_dan_kuning_berwarna_kuning():
+    k = kata_dari("HALO DUNIA", mulai=1.0)
+    assert _gaya_baris(S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="kotak"))[15] == "3"       # BorderStyle
+    assert _gaya_baris(S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="klasik"))[15] == "1"
+    assert _gaya_baris(S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="kuning"))[3] == "&H0000FFFF"
+
+
+def test_sorot_satu_peristiwa_per_kata_dan_hanya_satu_kata_berwarna():
+    k = kata_dari("HALO DUNIA SEMUA", mulai=1.0)
+    dialog = [b for b in S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="sorot").split("\n") if b.startswith("Dialogue:")]
+    assert len(dialog) == 3
+    for i, b in enumerate(dialog):
+        teks = b.split(",,", 1)[1]
+        assert teks.count("{\\1c&H0000D7FF&}") == 1                        # tepat satu kata disorot
+        assert "{\\1c&H0000D7FF&}" + ["HALO", "DUNIA", "SEMUA"][i] + "{\\1c&H00FFFFFF&}" in teks
+    waktu = [(b.split(",")[1], b.split(",")[2]) for b in dialog]
+    assert waktu[0][1] == waktu[1][0] and waktu[1][1] == waktu[2][0]                       # berurutan, tanpa tumpang tindih
+
+
+def test_posisi_dan_ukuran():
+    k = kata_dari("HALO DUNIA", mulai=1.0)
+    bawah, tengah, atas = (_gaya_baris(S.buat_ass(k, 0.5, 4.0, 360, 640, posisi=p)) for p in ("bawah", "tengah", "atas"))
+    assert (bawah[18], tengah[18], atas[18]) == ("2", "5", "8")                            # Alignment
+    kecil, sedang, besar = (int(_gaya_baris(S.buat_ass(k, 0.5, 4.0, 360, 640, ukuran=u))[2]) for u in ("kecil", "sedang", "besar"))
+    assert kecil < sedang < besar
+
+
+@pytest.mark.parametrize("kw", [{"gaya": "tidak ada"}, {"posisi": "kiri"}, {"ukuran": "raksasa"}])
+def test_pilihan_tidak_dikenal_ditolak(kw):
+    with pytest.raises(ValueError):
+        S.buat_ass(kata_dari("HALO"), 0.0, 2.0, 360, 640, **kw)
+
+
+def test_pilihan_subtitle_backend_sama_dengan_core():
+    from backend import proyek
+    assert proyek.GAYA_SUBTITLE == tuple(S.GAYA) and proyek.POSISI_SUBTITLE == S.POSISI
+    assert proyek.UKURAN_SUBTITLE == tuple(S.UKURAN)
+    assert proyek.ANIMASI_SUBTITLE == tuple(S.ANIMASI)
+    assert proyek.SUBTITLE_BAWAAN == {"gaya": S.GAYA_BAWAAN, "posisi": "bawah", "ukuran": "sedang", "animasi": "tanpa", "aktif": True}
+
+
+def test_animasi_awalan_di_depan_baris_dan_bawaan_tanpa_animasi():
+    k = kata_dari("HALO DUNIA", mulai=1.0)
+    polos = S.buat_ass(k, 0.5, 4.0, 360, 640)
+    assert "\\fad" not in polos and "\\t(" not in polos
+    assert ",,{\\fad(140,0)}HALO DUNIA" in S.buat_ass(k, 0.5, 4.0, 360, 640, animasi="pudar")
+    assert ",,{\\fscx70\\fscy70\\t(0,130,\\fscx100\\fscy100)}HALO DUNIA" in S.buat_ass(k, 0.5, 4.0, 360, 640, animasi="muncul")
+    with pytest.raises(ValueError):
+        S.buat_ass(k, 0.5, 4.0, 360, 640, animasi="melayang")
+
+
+def test_animasi_sorot_hanya_pada_kata_pertama_baris():
+    k = kata_dari("HALO DUNIA SEMUA", mulai=1.0)
+    dialog = [b for b in S.buat_ass(k, 0.5, 4.0, 360, 640, gaya="sorot", animasi="pudar").split("\n") if b.startswith("Dialogue:")]
+    assert "\\fad" in dialog[0] and "\\fad" not in dialog[1] and "\\fad" not in dialog[2]

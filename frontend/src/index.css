@@ -1,1 +1,32 @@
 @import "tailwindcss";
+
+/* Ukuran dasar 14px (bawaan 16px): seluruh tampilan ikut mengecil seragam karena Tailwind memakai rem. */
+html { font-size: 14px; }
+:root { color-scheme: dark; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+select, input[type="file"] { color-scheme: dark; }
+::selection { background: rgb(139 92 246 / 0.4); }
+
+/*
+ * Mode terang: skala abu-abu (zinc) dibalik, jadi bg-zinc-950 menjadi hampir putih dan text-zinc-200 menjadi hampir hitam.
+ * Warna aksen yang pucat di latar gelap (violet/amber/emerald/red 100-300) digelapkan supaya terbaca di latar terang.
+ */
+html.terang {
+  color-scheme: light;
+  --color-zinc-50: #09090b; --color-zinc-100: #18181b; --color-zinc-200: #27272a; --color-zinc-300: #3f3f46;
+  --color-zinc-400: #52525b; --color-zinc-500: #71717a; --color-zinc-600: #a1a1aa; --color-zinc-700: #d4d4d8;
+  --color-zinc-800: #e4e4e7; --color-zinc-900: #f4f4f5; --color-zinc-950: #fafafa;
+  --color-violet-200: #5b21b6; --color-violet-300: #6d28d9; --color-violet-400: #7c3aed;
+  --color-amber-200: #92400e; --color-amber-300: #b45309;
+  --color-emerald-100: #065f46; --color-emerald-200: #047857; --color-emerald-300: #047857;
+  --color-red-100: #991b1b; --color-red-200: #b91c1c; --color-red-300: #b91c1c;
+  --color-fuchsia-300: #a21caf;
+}
+html.terang select, html.terang input[type="file"] { color-scheme: light; }
+html.terang .text-white { color: var(--color-zinc-50); }
+html.terang .bg-white { background-color: var(--color-zinc-50); }
+/* tombol berwarna tetap berteks putih (cocokkan kelas utuh, bukan varian hover:bg-... yang hanya muncul saat disorot) */
+html.terang :is([class~="bg-violet-500"], [class~="bg-violet-600"], [class~="bg-red-600"], [class~="bg-emerald-600"], [class^="bg-black"], [class*=" bg-black"]).text-white,
+html.terang :is([class~="bg-violet-500"], [class~="bg-violet-600"], [class^="bg-black"], [class*=" bg-black"]) .text-white { color: #fff; }
+/* lapisan gelap di atas video: warna terang dikembalikan */
+html.terang :is([class^="bg-black"], [class*=" bg-black"]) { --color-violet-200: #ddd6fe; --color-zinc-300: #d4d4d8; --color-zinc-400: #a1a1aa; }

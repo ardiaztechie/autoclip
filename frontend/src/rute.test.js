@@ -11,10 +11,11 @@ test("uraiRute: halaman dikenal", () => {
   assert.deepEqual(uraiRute("#/proyek/"), { nama: "proyek" });
   assert.deepEqual(uraiRute("#/proyek/12"), { nama: "detail", id: 12 });
   assert.deepEqual(uraiRute("#/proyek?x=1"), { nama: "proyek" });
+  assert.deepEqual(uraiRute("#/proyek/12/klip/5"), { nama: "editor", id: 12, klip: 5 });
 });
 
 test("uraiRute: alamat aneh -> tidakada", () => {
-  for (const h of ["#/abc", "#/proyek/abc", "#/proyek/12/edit", "#/proyek/-1", "#/proyek/1234567890", "#//proyek"]) {
+  for (const h of ["#/abc", "#/proyek/abc", "#/proyek/12/edit", "#/proyek/12/klip", "#/proyek/12/klip/x", "#/proyek/12/klip/5/6", "#/proyek/-1", "#/proyek/1234567890", "#//proyek"]) {
     assert.deepEqual(uraiRute(h), { nama: "tidakada" }, h);
   }
 });
@@ -23,4 +24,13 @@ test("alamat dan uraiRute konsisten", () => {
   assert.deepEqual(uraiRute(alamat.beranda()), { nama: "beranda" });
   assert.deepEqual(uraiRute(alamat.proyek()), { nama: "proyek" });
   assert.deepEqual(uraiRute(alamat.detail(7)), { nama: "detail", id: 7 });
+  assert.deepEqual(uraiRute(alamat.editor(7, 3)), { nama: "editor", id: 7, klip: 3 });
+});
+
+test("rute masuk, cms, dan landing", () => {
+  assert.deepEqual(uraiRute("#/masuk"), { nama: "masuk" });
+  assert.deepEqual(uraiRute("#/cms/"), { nama: "cms" });
+  assert.deepEqual(uraiRute(alamat.landing()), { nama: "landing" });
+  assert.deepEqual(uraiRute(alamat.masuk()), { nama: "masuk" });
+  assert.deepEqual(uraiRute(alamat.cms()), { nama: "cms" });
 });

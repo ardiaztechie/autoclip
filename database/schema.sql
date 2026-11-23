@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS projects (
   ratio          ENUM('9:16','1:1','4:5') NOT NULL DEFAULT '9:16',
   n_clips        TINYINT UNSIGNED NULL,                   -- NULL = otomatis menurut durasi video dan clip_density
   clip_density   ENUM('jarang','sedang','rapat') NOT NULL DEFAULT 'sedang',   -- dipakai bila n_clips NULL
-  clip_length    ENUM('otomatis','pendek','sedang','panjang') NOT NULL DEFAULT 'otomatis',
+  clip_length    ENUM('otomatis','pendek','sedang','panjang','sangat_panjang','ekstra_panjang') NOT NULL DEFAULT 'otomatis',
   face_tracking  TINYINT(1) NOT NULL DEFAULT 1,
   status         ENUM('queued','processing','done','failed') NOT NULL DEFAULT 'queued',
   stage          VARCHAR(60) NOT NULL DEFAULT 'Antre',    -- contoh: 'Transkripsi'
@@ -216,10 +216,10 @@ INSERT IGNORE INTO landing_sections (section_key, content, sort_order) VALUES
  ('hero',
   '{"title":"Ubah video panjang menjadi clip pendek","subtitle":"Otomatis, lengkap dengan subtitle, judul, dan caption.","cta_text":"Masuk"}', 1),
  ('fitur',
-  '{"items":[{"title":"Clip otomatis","text":"Bagian menarik dipilih dan dipotong untuk kamu."},{"title":"Fokus ke wajah","text":"Bingkai mengikuti pembicara dan zoom secara halus."},{"title":"Siap diedit","text":"Koreksi subtitle, geser awal dan akhir, ganti judul."}]}', 2),
+  '{"items":[{"title":"Clip otomatis","text":"Bagian menarik dipilih dan dipotong untuk kamu."},{"title":"Fokus ke wajah","text":"Bingkai mengikuti pembicara dan zoom secara halus."},{"title":"Siap diedit","text":"Potong seperti di CapCut, koreksi subtitle, ganti judul."}]}', 2),
  ('cara_kerja',
   '{"steps":["Unggah video atau tempel tautan","Tunggu proses selesai","Edit seperlunya lalu unduh"]}', 3),
  ('faq',
-  '{"items":[{"q":"Berapa lama video maksimal?","a":"Maksimal 20 menit."}]}', 4),
+  '{"items":[{"q":"Berapa lama video maksimal?","a":"Tidak ada batas durasi; video yang lebih panjang hanya diproses lebih lama."}]}', 4),
  ('footer',
   '{"text":"Proyek skripsi Teknik Informatika"}', 5);

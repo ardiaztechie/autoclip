@@ -40,12 +40,13 @@ import argparse
 import bisect
 import json
 import math
+import random
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .penekanan import DURASI_SISA_MIN, FAKTOR_ZOOM
-from .face import (AMBANG_YAKIN, LEBAR_DETEKSI_MAKS, TAHAN_TANPA_WAJAH, ALPHA_HALUS, RASIO_VALID,
+from .face import (NAPAS_MIN, AMBANG_YAKIN, LEBAR_DETEKSI_MAKS, TAHAN_TANPA_WAJAH, ALPHA_HALUS, RASIO_VALID,
                    Jalur, Kotak, jalur_model, ukuran_potong)
 
 # --- Nilai awal (eksperimental) ---------------------------------------------
@@ -74,7 +75,26 @@ AWAL_LEBAR = 0.2              # detik; tampilan melebar mulai sedikit SEBELUM ge
 TAHAN_LEBAR = 0.5             # detik tampilan lebar dipertahankan setelah gerakan reda
 JENDELA_BASIS = 5.0           # detik; lebar jendela untuk median pembanding luas gerak
 SELANG_LEBAR_MIN = 1.5        # detik; tampilan lebar yang terlalu singkat diperpanjang sampai sepanjang ini
+ZONA_CAMPURAN = 0.10          # gaya campuran: zona nyaman lebih sempit agar bingkai lebih hidup (perkiraan, perlu dinilai di klip nyata)
 ZONA_NYAMAN = 0.20            # wajah boleh bergeser sejauh 20% ukuran jendela dari tengahnya tanpa jendela bergerak
+TANPA_WAJAH_MIN = 0.8        # detik tanpa wajah hidup (gaya campuran) => tampilan lebar, bukan potongan kosong
+TARGET_LEBAR_WAJAH = 0.35    # gaya campuran: wajah diusahakan selebar 35% jendela (perkiraan dari klip referensi)
+MAKS_ZOOM_DASAR = 1.8        # batas zoom dasar; lebih dari ini gambar sumber terlalu diperbesar (buram)
+AMBANG_ZOOM_DASAR = 1.08     # zoom dasar di bawah ini dianggap 1,0 (hindari zoom kecil yang naik turun)
+HALUS_ZOOM_DASAR = 0.15      # penghalusan zoom dasar per sampel
+ALPHA_CAMPURAN = 0.25        # gaya campuran: jendela mengikuti wajah lebih pelan (dan terus-menerus) agar terasa halus
+AMBANG_REAKSI = 3.0          # gerak wajah (0-255) minimal pada lawan bicara agar dihitung reaksi (perkiraan, perlu disetel)
+RASIO_REAKSI = 3.0           # ... dan minimal sekian kali gerak wajah biasa orang itu
+DURASI_REAKSI_MIN = 0.6      # detik beruntun gerak besar sebelum dianggap reaksi
+DURASI_REAKSI = (1.0, 2.0)   # detik: lama cut ke lawan bicara (paling sedikit, paling lama)
+SELANG_REAKSI_MIN = 8.0      # detik minimum antar cut reaksi
+POTONGAN_DURASI = (3.0, 5.0)   # detik: lama satu ukuran gambar sebelum potongan langsung berikutnya (perkiraan dari video referensi)
+POTONGAN_UKURAN = (1.0, 1.45, 1.2, 1.65, 1.0, 1.35)   # urutan faktor ukuran (1,0 = jendela biasa; makin besar makin dekat), berulang
+POTONGAN_LEBAR_WAJAH_MAKS = 0.62   # wajah tidak boleh lebih lebar dari 62% jendela setelah diperbesar (agar tidak terpotong)
+POTONGAN_BEDA_MIN = 0.15      # dua potongan berurutan harus beda ukuran sekian, kalau tidak potongannya tidak terasa
+POTONGAN_SEGMEN_MIN = 1.5     # detik; ukuran terakhir sebelum pergantian pembicara/akhir klip tidak boleh lebih pendek dari ini
+POTONGAN_JENDELA_JEDA = 1.0   # detik; potongan digeser ke jeda antar kata terdekat dalam jarak ini (hindari memotong di tengah kata)
+POTONGAN_JEDA_MIN = 0.1       # detik; jeda antar kata sekecil ini dianggap tempat napas
 TOLERANSI_LABEL = 0.12        # selisih posisi x (0-1) yang masih dianggap cocok dengan label
 
 
@@ -274,6 +294,64 @@ def pilih_pembicara(sampel, foto, ucapan=None, *, langkah: float = LANGKAH_ANALI
     return hasil
 
 
+def tambah_reaksi(sampel, pembicara, foto, *, langkah: float = LANGKAH_ANALISIS, ambang: float = AMBANG_REAKSI,
+                  rasio: float = RASIO_REAKSI) -> list:
+    """Cut singkat ke lawan bicara yang tiba-tiba bergerak/berekspresi (tertawa, kaget), lalu kembali.
+
+    Lawan bicara = wajah hidup yang bukan pembicara dan bukan foto. Syarat: gerak wajahnya >= `ambang` dan
+    >= `rasio` x gerak biasanya, beruntun >= DURASI_REAKSI_MIN. Cut berlangsung DURASI_REAKSI (1-2 dtk),
+    tidak melewati pergantian kamera, dan ada jarak SELANG_REAKSI_MIN antar cut. Hanya perkiraan dari gerak
+    wajah: gerakan menoleh bisa ikut terbaca, jadi batasnya sengaja ketat.
+    """
+    n = len(sampel)
+    hasil = list(pembicara)
+    nilai: dict = {}
+    for s in sampel:
+        for p in s.wajah:
+            if p.gerak_wajah is not None:
+                nilai.setdefault(p.id, []).append(p.gerak_wajah)
+    biasa = {i: _median(v) for i, v in nilai.items()}
+    if n == 0:
+        return hasil
+    minimal = _banyak(DURASI_REAKSI_MIN, langkah)
+    pendek, panjang = _banyak(DURASI_REAKSI[0], langkah), _banyak(DURASI_REAKSI[1], langkah)
+    jarak = _banyak(SELANG_REAKSI_MIN, langkah)
+    kandidat = []                                                      # (awal, akhir_run, id)
+    ids = {p.id for s in sampel for p in s.wajah if p.id not in foto}
+    for id_ in ids:
+        mulai = None
+        for i in range(n + 1):
+            ya = False
+            if i < n:
+                for p in sampel[i].wajah:
+                    if (p.id == id_ and p.gerak_wajah is not None and pembicara[i] not in (None, id_)
+                            and p.gerak_wajah >= max(ambang, rasio * biasa.get(id_, 0.0))):
+                        ya = True
+            if ya and mulai is None:
+                mulai = i
+            elif not ya and mulai is not None:
+                if i - mulai >= minimal:
+                    kandidat.append((mulai, i, id_))
+                mulai = None
+    terakhir = -10 ** 9
+    for awal, akhir_run, id_ in sorted(kandidat):
+        if awal - terakhir < jarak:
+            continue
+        akhir = min(max(akhir_run + _banyak(0.4, langkah), awal + pendek), awal + panjang, n)
+        if any(sampel[k].potong for k in range(awal + 1, akhir)):
+            akhir = next(k for k in range(awal + 1, akhir) if sampel[k].potong)
+            if akhir - awal < pendek:
+                continue
+        if any(hasil[k] != pembicara[k] for k in range(awal, akhir)):
+            continue
+        if any(id_ not in {p.id for p in sampel[k].wajah} for k in range(awal, akhir)):
+            continue
+        for k in range(awal, akhir):
+            hasil[k] = id_
+        terakhir = akhir
+    return hasil
+
+
 def _isi_awal(hasil, awal, akhir):
     """Dalam satu adegan, sampel awal yang belum punya pembicara diisi pembicara pertama adegan itu."""
     pertama = next((hasil[i] for i in range(awal, akhir) if hasil[i] is not None), None)
@@ -357,8 +435,13 @@ def deteksi_lonjakan(sampel, foto=frozenset(), *, langkah: float = LANGKAH_ANALI
 
 def susun_jalur(sampel, pembicara, foto, lebar: int, tinggi: int, rasio: str = "9:16", *,
                 selang_lebar=(), selang_zoom=(), faktor_zoom: float = FAKTOR_ZOOM,
-                alpha: float = ALPHA_HALUS, zona_mati: float = ZONA_NYAMAN, tahan: float = TAHAN_TANPA_WAJAH):
+                alpha: float = ALPHA_HALUS, zona_mati: float = ZONA_NYAMAN, tahan: float = TAHAN_TANPA_WAJAH,
+                gaya: str = "lama", napas: bool = True, zoom_dasar: bool = False,
+                potongan: bool = False, waktu_jeda=()):
     """Jalur jendela potong dari keputusan pembicara. Mengembalikan (Jalur, sasaran_x per sampel).
+
+    potongan (gaya campuran): ukuran gambar berganti dengan potongan langsung tiap 3-5 detik (lihat susun_potongan);
+    zoom penekanan dan zoom napas dimatikan agar tidak menumpuk dengan ukuran potongan.
 
     Pergantian pembicara atau kamera = LONCAT (dua titik berdekatan), bukan geseran.
     """
@@ -367,14 +450,19 @@ def susun_jalur(sampel, pembicara, foto, lebar: int, tinggi: int, rasio: str = "
     cx, cy = pusat_bingkai
     titik, sasaran_x, ada = [], [], 0
     titik_zoom, ada_wajah, zx, zy = [], [], pusat_bingkai[0], pusat_bingkai[1]
+    titik_mata, my, waktu_lompat, mata_lalu = [], None, [], None
+    titik_dasar, dasar, lebar_wajah = [], 1.0, []
     terakhir_sasaran, t_terakhir, spk_lalu = None, None, None
     for s, spk in zip(sampel, pembicara):
         hidup = [p for p in s.wajah if p.id not in foto]
-        sasaran = None
+        sasaran, orang = None, None
         if spk is not None:
-            sasaran = next((p.kotak.pusat for p in hidup if p.id == spk), None)
+            orang = next((p for p in hidup if p.id == spk), None)
         elif hidup:
-            sasaran = max(hidup, key=lambda p: p.kotak.luas).kotak.pusat
+            orang = max(hidup, key=lambda p: p.kotak.luas)
+        if orang is not None:
+            sasaran = orang.kotak.pusat
+            mata_lalu = orang.kotak.mata_y if orang.kotak.mata_y is not None else None
         if sasaran is not None:
             ada += 1
             terakhir_sasaran, t_terakhir = sasaran, s.t
@@ -385,6 +473,18 @@ def susun_jalur(sampel, pembicara, foto, lebar: int, tinggi: int, rasio: str = "
         lompat = s.potong or (spk != spk_lalu and spk is not None and spk_lalu is not None) or not titik
         spk_lalu = spk if spk is not None else spk_lalu
         ada_wajah.append(bool(hidup) and sasaran is not pusat_bingkai)
+        lebar_wajah.append(orang.kotak.w if orang is not None else None)
+        if lompat and titik:
+            waktu_lompat.append(s.t)
+        if mata_lalu is not None and sasaran is not pusat_bingkai:
+            my = mata_lalu if (lompat or my is None) else my + 0.4 * (mata_lalu - my)
+            titik_mata.append((round(float(s.t), 3), round(my, 2)))
+        if zoom_dasar and orang is not None:
+            ideal = TARGET_LEBAR_WAJAH * wp / orang.kotak.w if orang.kotak.w > 0 else 1.0
+            ideal = min(max(ideal, 1.0), MAKS_ZOOM_DASAR)
+            ideal = 1.0 if ideal < AMBANG_ZOOM_DASAR else ideal
+            dasar = ideal if (lompat or not titik_dasar) else dasar + HALUS_ZOOM_DASAR * (ideal - dasar)
+        titik_dasar.append((round(float(s.t), 3), round(dasar, 3)))
         if lompat:
             zx, zy = sasaran
         else:
@@ -410,12 +510,137 @@ def susun_jalur(sampel, pembicara, foto, lebar: int, tinggi: int, rasio: str = "
     persen = ada / len(sampel) if sampel else 0.0
     lebar_penuh = (wp, hp) == (lebar, tinggi)
     selang_lebar = () if lebar_penuh else tuple(selang_lebar)
+    campuran = gaya == "campuran"
+    if campuran and not lebar_penuh and sampel:        # tidak ada wajah: tampilkan seluruh bingkai, jangan tembok kosong
+        langkah = (sampel[1].t - sampel[0].t) if len(sampel) > 1 else LANGKAH_ANALISIS
+        kosong = selang_tanpa_wajah([s.t for s in sampel], ada_wajah, langkah)
+        selang_lebar = _gabung_selang(tuple(selang_lebar) + tuple(kosong))
     zoom = ()
-    if faktor_zoom and faktor_zoom > 1.0 and selang_zoom:
+    pakai_potongan = bool(potongan) and campuran and not lebar_penuh and bool(sampel)
+    if pakai_potongan:
+        jadwal = susun_potongan([s.t for s in sampel], lebar_wajah, waktu_lompat + [s.t for s in sampel if s.potong],
+                                waktu_jeda, wp, awal_acak=int(round(sampel[0].t * 1000)))
+        titik_dasar = list(titik_dari_potongan(jadwal)) if any(f > 1.0005 for _, f in jadwal) else []
+    if faktor_zoom and faktor_zoom > 1.0 and selang_zoom and not pakai_potongan:
         zoom = saring_zoom(selang_zoom, selang_lebar, [s.t for s in sampel if s.potong],
                            [s.t for s in sampel], ada_wajah)
+    selang_napas = ()
+    if campuran and napas and sampel and not lebar_penuh and not pakai_potongan:
+        selang_napas = susun_napas(sampel[0].t, sampel[-1].t, tuple(selang_lebar) + zoom,
+                                   [s.t for s in sampel if s.potong] + waktu_lompat,
+                                   [s.t for s in sampel], ada_wajah)
+    dasar_aktif = campuran and any(f > 1.0005 for _, f in titik_dasar)
+    perlu_pusat = bool(zoom) or bool(selang_napas) or dasar_aktif
     return (Jalur(titik, wp, hp, lebar, tinggi, rasio, persen, selang_lebar, zoom,
-                  float(faktor_zoom) if zoom else 1.0, tuple(titik_zoom) if zoom else ()), sasaran_x)
+                  float(faktor_zoom) if zoom else 1.0, tuple(titik_zoom) if perlu_pusat else (),
+                  "campuran" if campuran else "lama", selang_napas,
+                  tuple(titik_mata) if campuran and perlu_pusat else (),
+                  tuple(titik_dasar) if dasar_aktif else ()), sasaran_x)
+
+
+def selang_tanpa_wajah(waktu_sampel, ada_wajah, langkah: float = LANGKAH_ANALISIS,
+                       minimal: float = TANPA_WAJAH_MIN) -> list:
+    """Selang [(awal, akhir)] tempat tidak ada wajah hidup selama paling sedikit `minimal` detik.
+    Selang dimulai di sampel pertama tanpa wajah (analisis offline, jadi boleh mundur)."""
+    hasil, mulai = [], None
+    n = len(waktu_sampel)
+    for i in range(n + 1):
+        kosong = i < n and not ada_wajah[i]
+        if kosong and mulai is None:
+            mulai = i
+        elif not kosong and mulai is not None:
+            akhir = waktu_sampel[i] if i < n else waktu_sampel[-1] + langkah
+            if akhir - waktu_sampel[mulai] >= minimal - 1e-9:
+                hasil.append((float(waktu_sampel[mulai]), float(akhir)))
+            mulai = None
+    return hasil
+
+
+def _gabung_selang(selang) -> tuple:
+    gabung = []
+    for a, b in sorted((float(a), float(b)) for a, b in selang):
+        if gabung and a <= gabung[-1][1]:
+            gabung[-1] = (gabung[-1][0], max(gabung[-1][1], b))
+        else:
+            gabung.append((a, b))
+    return tuple((round(a, 3), round(b, 3)) for a, b in gabung)
+
+
+def titik_jeda(kata, mulai: float, akhir: float, jeda_min: float = POTONGAN_JEDA_MIN) -> list:
+    """Waktu tengah jeda antar kata (>= jeda_min) di dalam [mulai, akhir]; tempat yang aman untuk potongan gambar."""
+    urut = sorted((k for k in (kata or []) if k.end >= mulai and k.start <= akhir), key=lambda k: k.start)
+    return [round((a.end + b.start) / 2, 3) for a, b in zip(urut, urut[1:]) if b.start - a.end >= jeda_min - 1e-9]
+
+
+def susun_potongan(waktu_sampel, lebar_wajah, waktu_ganti, waktu_jeda, wp: float, *, durasi=POTONGAN_DURASI,
+                   ukuran=POTONGAN_UKURAN, awal_acak: int = 0) -> list:
+    """Jadwal ukuran gambar bergaya potong-langsung: [(waktu mulai, faktor)], faktor 1,0 = jendela biasa.
+
+    Tiap 3-5 detik ukuran berganti dengan potongan langsung; pergantian pembicara/kamera (waktu_ganti) selalu
+    jadi potongan; potongan digeser ke jeda antar kata terdekat. Faktor dibatasi agar wajah pembicara tidak lebih
+    lebar dari POTONGAN_LEBAR_WAJAH_MAKS jendela, dan dua ukuran berurutan beda paling sedikit POTONGAN_BEDA_MIN.
+    Acak diatur oleh awal_acak, jadi render ulang klip yang sama menghasilkan potongan yang sama."""
+    if not waktu_sampel:
+        return []
+    rng = random.Random(awal_acak)
+    mulai, akhir = float(waktu_sampel[0]), float(waktu_sampel[-1])
+    batas = [mulai] + sorted(t for t in waktu_ganti if mulai + 0.5 < t < akhir - 0.5) + [akhir]
+    potong = [mulai]
+    for a, b in zip(batas, batas[1:]):                      # jadwal di dalam tiap bagian di antara pergantian alami
+        if a != mulai:
+            potong.append(a)
+        kursor = a
+        for _ in range(100):
+            target = kursor + rng.uniform(*durasi)
+            if target > b - POTONGAN_SEGMEN_MIN:
+                break
+            dekat = [j for j in waktu_jeda if abs(j - target) <= POTONGAN_JENDELA_JEDA and kursor + 1.0 < j < b - POTONGAN_SEGMEN_MIN]
+            if waktu_jeda and dekat:
+                target = min(dekat, key=lambda j: abs(j - target))
+            elif waktu_jeda:                                # tidak ada jeda dekat: perpanjang ukuran ini sedikit
+                kursor += 0.5
+                continue
+            potong.append(round(target, 3))
+            kursor = target
+    potong = sorted(set(round(t, 3) for t in potong))
+    hasil, lalu, urut = [], None, 0
+    for i, t0 in enumerate(potong):
+        t1 = potong[i + 1] if i + 1 < len(potong) else akhir + 1e-9
+        lebar = sorted(w for t, w in zip(waktu_sampel, lebar_wajah) if w and t0 - 1e-9 <= t <= t1)
+        batas_wajah = POTONGAN_LEBAR_WAJAH_MAKS * wp / lebar[len(lebar) // 2] if lebar else MAKS_ZOOM_DASAR
+        pilihan = None
+        for k in range(len(ukuran)):                         # ukuran berikutnya dalam pola yang cukup beda dari yang lalu
+            kandidat = min(ukuran[(urut + k) % len(ukuran)], batas_wajah, MAKS_ZOOM_DASAR)
+            kandidat = 1.0 if kandidat < AMBANG_ZOOM_DASAR else kandidat
+            if lalu is None or abs(kandidat - lalu) >= POTONGAN_BEDA_MIN:
+                pilihan = kandidat
+                urut += k + 1
+                break
+        if pilihan is None:                                  # semua terlalu mirip (wajah besar): ganti ke 1,0 / ukuran maksimum
+            pilihan = 1.0 if lalu is not None and lalu > 1.0 else min(batas_wajah, MAKS_ZOOM_DASAR)
+            pilihan = 1.0 if pilihan < AMBANG_ZOOM_DASAR else pilihan
+            urut += 1
+        hasil.append((t0, round(pilihan, 3)))
+        lalu = pilihan
+    return hasil
+
+
+def titik_dari_potongan(potongan) -> tuple:
+    """Jadwal [(waktu, faktor)] menjadi titik zoom dasar bertangga: tiap pergantian = dua titik berselisih 1 ms (potongan langsung)."""
+    titik = []
+    for i, (t, f) in enumerate(potongan):
+        if i:
+            titik.append((round(t - 0.001, 3), potongan[i - 1][1]))
+        titik.append((round(t, 3), f))
+    return tuple(titik)
+
+
+def susun_napas(awal: float, akhir: float, terpakai, waktu_potong, waktu_sampel, ada_wajah) -> tuple:
+    """Bagian tenang (di luar tampilan lebar dan zoom penekanan, tanpa pergantian kamera/pembicara di
+    tengahnya) yang cukup panjang diberi zoom pelan. Arah bergantian: mendekat, menjauh, mendekat, ..."""
+    bagian = saring_zoom([(awal, akhir)], terpakai, waktu_potong, waktu_sampel, ada_wajah)
+    panjang = [(a, b) for a, b in bagian if b - a >= NAPAS_MIN - 1e-9]
+    return tuple((a, b, 1 if i % 2 == 0 else -1) for i, (a, b) in enumerate(panjang))
 
 
 def saring_zoom(selang_zoom, selang_lebar, waktu_potong, waktu_sampel, ada_wajah) -> tuple:
@@ -492,13 +717,14 @@ def _petak(gray, k: Kotak, bagian: str):
 
 
 def _halus(lama: Kotak, baru: Kotak, a: float = HALUS_KOTAK) -> Kotak:
+    mata = baru.mata_y if lama.mata_y is None or baru.mata_y is None else lama.mata_y + a * (baru.mata_y - lama.mata_y)
     return Kotak(lama.x + a * (baru.x - lama.x), lama.y + a * (baru.y - lama.y),
-                 lama.w + a * (baru.w - lama.w), lama.h + a * (baru.h - lama.h), baru.skor)
+                 lama.w + a * (baru.w - lama.w), lama.h + a * (baru.h - lama.h), baru.skor, mata)
 
 
 def analisis_video(path_video, mulai: float, akhir: float, *, langkah: float = LANGKAH_ANALISIS,
-                   path_model=None, ambang: float = AMBANG_YAKIN):
-    """Mengembalikan (daftar Sampel, lebar, tinggi, fps)."""
+                   path_model=None, ambang: float = AMBANG_YAKIN, pada_kemajuan=None):
+    """Mengembalikan (daftar Sampel, lebar, tinggi, fps). pada_kemajuan(bagian 0..1) dipanggil tiap sampel (opsional)."""
     if not (math.isfinite(mulai) and math.isfinite(akhir)) or mulai < 0 or akhir <= mulai:
         raise ValueError("mulai harus >= 0 dan akhir harus lebih besar dari mulai")
     if not math.isfinite(langkah) or langkah <= 0:
@@ -558,7 +784,8 @@ def analisis_video(path_video, mulai: float, akhir: float, *, langkah: float = L
                 pelacak.reset()
                 keadaan.clear()
             _, wajah = detektor.detect(kecil)
-            kotak = [Kotak(float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[14]))
+            kotak = [Kotak(float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[14]),
+                           (float(r[5]) + float(r[7])) / 2)
                      for r in (wajah if wajah is not None else [])]
             ids = pelacak.perbarui(kotak)
             pengamatan = []
@@ -576,26 +803,37 @@ def analisis_video(path_video, mulai: float, akhir: float, *, langkah: float = L
                     if a is not None and b is not None:
                         gerak_wajah = float(np.mean(np.abs(a - b)))
                 keadaan[id_] = {"halus": halus, "mulut": mulut}
-                pengamatan.append(Pengamatan(id_, Kotak(k.x / skala, k.y / skala, k.w / skala, k.h / skala, k.skor),
+                mata = None if halus.mata_y is None else halus.mata_y / skala
+                pengamatan.append(Pengamatan(id_, Kotak(k.x / skala, k.y / skala, k.w / skala, k.h / skala, k.skor, mata),
                                              gerak_mulut, gerak_wajah))
             hasil.append(Sampel(round(t, 3), tuple(pengamatan), potong, luas_gerak))
             gray_lalu, thumb_lalu = gray, thumb
+            if pada_kemajuan is not None:
+                pada_kemajuan(min(1.0, max(0.0, (t - mulai) / (akhir - mulai))))
         return hasil, lebar, tinggi, fps
     finally:
         cap.release()
 
 
 def lacak_pembicara(path_video, mulai: float, akhir: float, rasio: str = "9:16", *, kata=None, path_model=None,
-                    selang_zoom=(), faktor_zoom: float = FAKTOR_ZOOM):
+                    selang_zoom=(), faktor_zoom: float = FAKTOR_ZOOM, gaya: str = "lama", napas: bool = True,
+                    reaksi: bool = False, zoom_dasar: bool = False, pada_kemajuan=None, potongan: bool = False):
     """Alur lengkap: analisis -> foto -> pembicara -> lonjakan -> jalur. Mengembalikan (Jalur, Laporan)."""
-    sampel, lebar, tinggi, _ = analisis_video(path_video, mulai, akhir, path_model=path_model)
+    sampel, lebar, tinggi, _ = analisis_video(path_video, mulai, akhir, path_model=path_model,
+                                              pada_kemajuan=pada_kemajuan)
     if not sampel:
         raise ValueError("tidak ada frame terbaca pada rentang waktu itu")
     foto, med = klasifikasi_foto(sampel)
     pembicara = pilih_pembicara(sampel, foto, ada_ucapan(kata) if kata is not None else None)
+    if gaya == "campuran" and reaksi:                  # eksperimen: mati bawaan, pembicara tetap diutamakan
+        pembicara = tambah_reaksi(sampel, pembicara, foto)
     lonjakan = deteksi_lonjakan(sampel, foto)
     jalur, sasaran_x = susun_jalur(sampel, pembicara, foto, lebar, tinggi, rasio, selang_lebar=lonjakan,
-                                   selang_zoom=selang_zoom, faktor_zoom=faktor_zoom)
+                                   selang_zoom=selang_zoom, faktor_zoom=faktor_zoom, gaya=gaya, napas=napas, zoom_dasar=zoom_dasar,
+                                   potongan=potongan,
+                                   waktu_jeda=titik_jeda(kata, sampel[0].t, sampel[-1].t) if kata is not None else (),
+                                   zona_mati=ZONA_CAMPURAN if gaya == "campuran" else ZONA_NYAMAN,
+                                   alpha=ALPHA_CAMPURAN if gaya == "campuran" else ALPHA_HALUS)
 
     luas = [x.luas_gerak for x in sampel]
     cepat = kecepatan_wajah(sampel, foto)

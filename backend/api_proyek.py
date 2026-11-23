@@ -90,7 +90,7 @@ def buat_proyek(
     ratio: Literal["9:16", "1:1", "4:5"] = Form("9:16"),
     n_clips: int | None = Form(None, ge=1, le=50),
     clip_density: Literal["jarang", "sedang", "rapat"] = Form("sedang"),
-    clip_length: Literal["otomatis", "pendek", "sedang", "panjang"] = Form("otomatis"),
+    clip_length: Literal["otomatis", "pendek", "sedang", "panjang", "sangat_panjang", "ekstra_panjang"] = Form("otomatis"),
     face_tracking: bool = Form(True),
     u: dict = Depends(pengguna_saat_ini),
 ):
@@ -177,3 +177,38 @@ def detail_proyek(project_id: int, request: Request, u: dict = Depends(pengguna_
     if p is None:
         raise HTTPException(404, "Proyek tidak ditemukan")         # proyek orang lain pun dijawab 404
     return p
+
+
+@router.post("/projects/{project_id}/batal")
+def batal_proyek(project_id: int, request: Request, u: dict = Depends(pengguna_saat_ini)):
+    """Membatalkan pemrosesan proyek yang masih antre atau berjalan. Proyek tidak dihapus."""
+    with request.app.state.konteks.engine().begin() as c:
+        try:
+            return proyek.batalkan_proyek(c, project_id, u["id"])
+        except LookupError:
+            raise HTTPException(404, "Proyek tidak ditemukan") from None
+        except RuntimeError:
+            raise HTTPException(409, "Proyek ini tidak sedang diproses") from None
+
+
+def hapus_folder_proyek(konteks, project_id: int) -> None:
+    """Menghapus folder berkas proyek (video asli, kata.json, klip hasil). Galat disk diabaikan: baris database sudah terhapus."""
+    import shutil
+    folder = (konteks.unggah()["folder"] / "projects" / str(project_id)).resolve()
+    akar = (konteks.unggah()["folder"] / "projects").resolve()
+    if folder.parent == akar and folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def hapus_proyek(project_id: int, request: Request, u: dict = Depends(pengguna_saat_ini)):
+    """Menghapus proyek beserta semua klip dan berkas videonya. Tidak bisa dibatalkan."""
+    konteks = request.app.state.konteks
+    with konteks.engine().begin() as c:
+        try:
+            proyek.hapus_proyek(c, project_id, u["id"])
+        except LookupError:
+            raise HTTPException(404, "Proyek tidak ditemukan") from None
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from None
+    hapus_folder_proyek(konteks, project_id)

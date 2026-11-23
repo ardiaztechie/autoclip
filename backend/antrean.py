@@ -3,7 +3,7 @@ import json
 
 from sqlalchemy import text
 
-JENIS_DIDUKUNG = ("process_project",)
+JENIS_DIDUKUNG = ("process_project", "render_clip")
 MAKS_PERCOBAAN = 3
 _DAFTAR_JENIS = ", ".join(f"'{j}'" for j in JENIS_DIDUKUNG)      # konstanta di atas, bukan masukan pengguna
 
@@ -40,12 +40,17 @@ def pulihkan_terhenti(k) -> list:
     Dikembalikan ke antrean (maks MAKS_PERCOBAAN kali), selebihnya digagalkan.
     Mengembalikan [(job_id, project_id atau None, diulang: bool)]."""
     hasil = []
-    for baris in k.execute(text("SELECT id, payload, attempts FROM job_queue WHERE status = 'running' ORDER BY id")).all():
+    for baris in k.execute(text("SELECT id, payload, attempts, type FROM job_queue WHERE status = 'running' ORDER BY id")).all():
         try:
-            pid = int(json.loads(baris.payload)["project_id"])
+            isi = json.loads(baris.payload)
+            pid = int(isi["project_id"])
         except (TypeError, ValueError, KeyError):
-            pid = None
+            isi, pid = None, None
         diulang = baris.attempts < MAKS_PERCOBAAN
+        if baris.type == "render_clip":                   # render ulang satu klip: status proyek tidak disentuh
+            pid = None
+            if not diulang and isinstance(isi, dict) and isinstance(isi.get("clip_id"), int):
+                k.execute(text("UPDATE clips SET status = 'failed' WHERE id = :c AND status = 'rendering'"), {"c": isi["clip_id"]})
         if diulang:
             k.execute(text("UPDATE job_queue SET status = 'queued', locked_at = NULL WHERE id = :i"), {"i": baris.id})
         else:

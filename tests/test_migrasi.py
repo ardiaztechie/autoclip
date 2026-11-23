@@ -18,16 +18,19 @@ class _Hasil:
 class KoneksiPalsu:
     """kolom: {nama_kolom: boleh_kosong(bool)} untuk tabel projects; kolom yang tidak ada = belum ada."""
 
-    def __init__(self, kolom):
+    def __init__(self, kolom, panjang_sampai_3_menit=True):
         self.kolom = dict(kolom)
         self.perintah = []
+        self.tipe_panjang = ("enum('otomatis','pendek','sedang','panjang','sangat_panjang','ekstra_panjang')" if panjang_sampai_3_menit
+                             else "enum('otomatis','pendek','sedang','panjang')")
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
         if "information_schema" in sql:
             nama = params["c"]
             assert params["t"] == "projects"
-            return _Hasil((("YES" if self.kolom[nama] else "NO"),) if nama in self.kolom else None)
+            tipe = self.tipe_panjang if nama == "clip_length" else "tinyint(3) unsigned"
+            return _Hasil((("YES" if self.kolom[nama] else "NO"), tipe) if nama in self.kolom else None)
         self.perintah.append(sql)
         return _Hasil(None)
 
@@ -39,8 +42,15 @@ BARU = {"n_clips": True, "clip_density": False, "clip_length": False}
 def test_database_lama_dimigrasi():
     k = KoneksiPalsu(LAMA)
     laporan = migrasi.terapkan(k)
-    assert k.perintah == [migrasi.SQL_N_CLIPS_BOLEH_KOSONG, migrasi.SQL_KEPADATAN, migrasi.SQL_PANJANG]
+    assert k.perintah == [migrasi.SQL_N_CLIPS_BOLEH_KOSONG, migrasi.SQL_KEPADATAN, migrasi.SQL_PANJANG]   # kolom baru sudah lengkap
     assert len(laporan) == 3 and "boleh kosong" in laporan[0] and "ditambahkan" in laporan[1] + laporan[2]
+
+
+def test_enum_lama_ditambah_sangat_panjang():
+    k = KoneksiPalsu(BARU, panjang_sampai_3_menit=False)
+    laporan = migrasi.terapkan(k)
+    assert k.perintah == [migrasi.SQL_PANJANG_SAMPAI_3_MENIT] and "sangat_panjang" in laporan[-1]
+    assert "ekstra_panjang" in migrasi.SQL_PANJANG_SAMPAI_3_MENIT
 
 
 def test_database_sudah_baru_tidak_diubah_lagi():

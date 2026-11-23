@@ -39,6 +39,8 @@ PRESET_DURASI = {                    # nama -> (min_detik, maks_detik)
     "pendek": (15.0, 30.0),
     "sedang": (30.0, 60.0),
     "panjang": (60.0, 90.0),
+    "sangat_panjang": (90.0, 120.0),   # sampai 2 menit
+    "ekstra_panjang": (120.0, 180.0),  # sampai 3 menit
 }
 
 
